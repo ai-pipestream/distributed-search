@@ -1,0 +1,11 @@
+# ScaleCube Cluster: gossip-based membership (lighter than scalecube-services)
+# Stork: Quarkus-native service discovery (custom provider for ScaleCube)
+[versions]
+scalecube-cluster = "2.7.7"
+stork = "2.7.7"
+
+[libraries]
+scalecube-cluster = { group = "io.scalecube", name = "scalecube-cluster", version.ref = "scalecube-cluster" }
+scalecube-transport-netty = { group = "io.scalecube", name = "scalecube-transport-netty", version.ref = "scalecube-cluster" }
+stork-core = { group = "io.smallrye.stork", name = "stork-core", version.ref = "stork" }
+stork-configuration-generator = { group = "io.smallrye.stork", name = "stork-configuration-generator", version.ref = "stork" }

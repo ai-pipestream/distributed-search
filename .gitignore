@@ -1,0 +1,23 @@
+# Build outputs
+build/
+.gradle/
+knn-node/build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+
+# Logs
+*.log
+
+# Index data (too large for git)
+shards-*/
+index/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package knn.collab;
+
+option java_multiple_files = true;
+option java_package = "org.apache.lucene.collab.grpc";
+
+service KnnNode {
+  // Primary search execution (Server Streaming)
+  rpc Search (SearchRequest) returns (stream SearchResponse);
+
+  // High-speed coordination channel (Bidirectional Streaming)
+  rpc Coordinate (stream ThresholdUpdate) returns (stream ThresholdUpdate);
+}
+
+message SearchRequest {
+  string query_id = 1;
+  repeated float vector = 2;
+  int32 k = 3;
+  bool collaborative = 4;  // if false, use standard KNN search without cross-shard coordination
+}
+
+message SearchResponse {
+  repeated Hit hits = 1;
+  int64 nodes_visited = 2;
+  int64 search_time_ms = 3;
+}
+
+message Hit {
+  int64 global_id = 1;
+  float score = 2;
+  string chunk = 3;           // The text content of the document (stored field)
+  repeated float vector = 4;  // The embedding vector of the document
+}
+
+message ThresholdUpdate {
+  string query_id = 1;
+  float min_score = 2;
+}
