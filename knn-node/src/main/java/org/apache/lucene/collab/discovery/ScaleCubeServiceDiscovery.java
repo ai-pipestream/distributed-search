@@ -48,9 +48,9 @@ public class ScaleCubeServiceDiscovery implements ServiceDiscovery {
             return Uni.createFrom().item(Collections.emptyList());
         }
 
-        int grpcPort;
+        int fallbackGrpcPort;
         try {
-            grpcPort = Integer.parseInt(grpcPortStr.trim());
+            fallbackGrpcPort = Integer.parseInt(grpcPortStr.trim());
         } catch (NumberFormatException e) {
             LOG.warnf("ScaleCube discovery: invalid grpc-port '%s'", grpcPortStr);
             return Uni.createFrom().item(Collections.emptyList());
@@ -80,16 +80,16 @@ public class ScaleCubeServiceDiscovery implements ServiceDiscovery {
                         a.meta.replicaId() <= b.meta.replicaId() ? a : b);
             }
             instances = bestPerShard.values().stream()
-                    .map(mwm -> toServiceInstance(mwm.member, grpcPort))
+                    .map(mwm -> toServiceInstance(mwm.member, resolveGrpcPort(mwm, fallbackGrpcPort)))
                     .collect(Collectors.toList());
         } else {
             instances = withMeta.stream()
-                    .map(mwm -> toServiceInstance(mwm.member, grpcPort))
+                    .map(mwm -> toServiceInstance(mwm.member, resolveGrpcPort(mwm, fallbackGrpcPort)))
                     .collect(Collectors.toList());
         }
 
-        LOG.debugf("ScaleCube discovered %d instance(s) for gRPC port %d (dedupe=%s, collection=%s)",
-                instances.size(), grpcPort, dedupeReplicas, collectionFilterFinal);
+        LOG.debugf("ScaleCube discovered %d instance(s) for gRPC (fallback-port=%d, dedupe=%s, collection=%s)",
+                instances.size(), fallbackGrpcPort, dedupeReplicas, collectionFilterFinal);
         return Uni.createFrom().item(instances);
     }
 
@@ -112,6 +112,11 @@ public class ScaleCubeServiceDiscovery implements ServiceDiscovery {
     private ServiceInstance toServiceInstance(Member member, int grpcPort) {
         String host = parseHost(member.address());
         return new DefaultServiceInstance(ServiceInstanceIds.next(), host, grpcPort, false);
+    }
+
+    private static int resolveGrpcPort(MemberWithMeta mwm, int fallbackGrpcPort) {
+        int advertised = mwm.meta.grpcPort();
+        return advertised > 0 ? advertised : fallbackGrpcPort;
     }
 
     private static String parseHost(String address) {

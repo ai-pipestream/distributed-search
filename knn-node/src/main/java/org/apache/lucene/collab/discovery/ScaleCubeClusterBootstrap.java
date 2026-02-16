@@ -3,7 +3,7 @@ package org.apache.lucene.collab.discovery;
 import io.scalecube.cluster.Cluster;
 import io.scalecube.cluster.ClusterConfig;
 import io.scalecube.cluster.ClusterImpl;
-import io.scalecube.cluster.membership.MembershipConfig;
+import io.scalecube.transport.netty.tcp.TcpTransportFactory;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import org.eclipse.microprofile.config.ConfigProvider;
@@ -45,7 +45,10 @@ public class ScaleCubeClusterBootstrap {
         }
 
         try {
+            int scaleCubePort = ConfigProvider.getConfig()
+                    .getOptionalValue("knn.scalecube.port", Integer.class).orElse(4800);
             ClusterConfig config = ClusterConfig.defaultLanConfig()
+                    .transport(t -> t.port(scaleCubePort).transportFactory(new TcpTransportFactory()))
                     .membership(m -> m.seedMembers(seeds));
             cluster = new ClusterImpl(config).startAwait();
             enabled = true;
@@ -56,8 +59,10 @@ public class ScaleCubeClusterBootstrap {
                     .getOptionalValue("knn.replica.id", Integer.class).orElse(0);
             String collection = ConfigProvider.getConfig()
                     .getOptionalValue("knn.collection", String.class).orElse("");
+            int grpcPort = ConfigProvider.getConfig()
+                    .getOptionalValue("quarkus.grpc.server.port", Integer.class).orElse(48101);
 
-            ShardMetadata metadata = new ShardMetadata(shardId, replicaId, collection);
+            ShardMetadata metadata = new ShardMetadata(shardId, replicaId, collection, grpcPort);
             cluster.updateMetadata(metadata).block();
             LOG.infof("ScaleCube cluster joined. Members: %d (including self). Address: %s. Metadata: %s",
                     cluster.members().size(), cluster.address(), metadata);
