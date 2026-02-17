@@ -19,6 +19,6 @@ This model leverages gRPC bi-directional streaming to handle multiplexing across
 
 ## Impact
 *   **Zero Latency Bubble**: Shards work at full tilt until satisfied or killed.
-*   **ARM Optimized**: Maximizes Raspberry Pi 5 CPU efficiency by eliminating redundant vector math as early as possible.
+*   **CPU Efficient**: Eliminates redundant vector math as early as possible.
 *   **Balanced Cluster Load**: Shards with relevant data do more work; shards with irrelevant data are "killed" after a few milliseconds.
 *   **Ideal for High K**: When $K=5000$, this prevents the cluster from doing the work of 50,000+ vector scores if the top 5,000 are found in the first few shards.

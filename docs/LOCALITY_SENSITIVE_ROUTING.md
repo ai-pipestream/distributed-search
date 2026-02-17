@@ -4,7 +4,7 @@
 Current sharding is random (Round-Robin or Hash-based). This guarantees uniform distribution but forces **every shard** to be searched for **every query**.
 
 **Locality Sensitive Sharding (LSS)** groups "similar" vectors onto the same shard at index time.
-*   **Clustering**: Vectors are assigned to shards based on a coarse clustering algorithm (e.g., K-Means on the Pi coordinator).
+*   **Clustering**: Vectors are assigned to shards based on a coarse clustering algorithm (e.g., K-Means on the coordinator).
 *   **Routing**: "Literature" vectors go to Shards 1-2. "Technical" vectors go to Shards 3-4.
 
 ## The Query-Time Advantage
@@ -27,6 +27,6 @@ If a document is large and has chunks that span multiple topics (e.g., a technic
     *   **Broadcast**: Query is ambiguous; send to all.
     *   **Unicast/Multicast**: Query is specific; send only to relevant shards.
 
-## Impact on Pi Cluster
+## Impact on Cluster
 *   **IO Reduction**: 75% of shards stay idle for any given specific query.
 *   **Cache Locality**: Shards become "experts" in their domain, keeping relevant graph neighborhoods hot in the page cache.

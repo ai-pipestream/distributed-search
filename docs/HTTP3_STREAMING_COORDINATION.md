@@ -1,7 +1,7 @@
 # Research: HTTP/3 (QUIC) Streaming Coordination
 
 ## The Concept
-Current coordination uses gRPC over HTTP/2 (TCP). While efficient, TCP suffers from **Head-of-Line Blocking** and handshake latency, especially on consumer-grade networks or WiFi-connected Raspberry Pis.
+Current coordination uses gRPC over HTTP/2 (TCP). While efficient, TCP suffers from **Head-of-Line Blocking** and handshake latency, especially on constrained or lossy networks.
 
 **HTTP/3 (QUIC)** runs over UDP. It offers:
 1.  **True Multiplexing**: Packet loss on one stream does not block others.
