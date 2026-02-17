@@ -25,7 +25,7 @@ dependencies {
     testImplementation 'io.rest-assured:rest-assured'
 }
 
-group = 'org.apache.lucene.collab'
+group = 'ai.pipestream.search'
 version = '1.0.0-SNAPSHOT'
 
 java {

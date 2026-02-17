@@ -3,37 +3,43 @@ syntax = "proto3";
 package knn.collab;
 
 option java_multiple_files = true;
-option java_package = "org.apache.lucene.collab.grpc";
+option java_package = "ai.pipestream.search.grpc";
 
-service KnnNode {
-  // Primary search execution (Server Streaming)
+service KnnNodeService {
+  // Primary search: Shard streams hits individually as they are found
   rpc Search (SearchRequest) returns (stream SearchResponse);
 
-  // High-speed coordination channel (Bidirectional Streaming)
-  rpc Coordinate (stream ThresholdUpdate) returns (stream ThresholdUpdate);
+  // High-speed coordination: Truly bi-directional
+  // Shard pushes local floor updates -> Coordinator pushes global floor updates
+  rpc Coordinate (stream CoordinateRequest) returns (stream CoordinateResponse);
 }
 
 message SearchRequest {
   string query_id = 1;
   repeated float vector = 2;
   int32 k = 3;
-  bool collaborative = 4;  // if false, use standard KNN search without cross-shard coordination
+  bool collaborative = 4;
 }
 
 message SearchResponse {
-  repeated Hit hits = 1;
-  int64 nodes_visited = 2;
-  int64 search_time_ms = 3;
-}
-
-message Hit {
   int64 global_id = 1;
   float score = 2;
-  string chunk = 3;           // The text content of the document (stored field)
-  repeated float vector = 4;  // The embedding vector of the document
+  string chunk = 3;
+  repeated float vector = 4;
+  
+  // Optional metadata sent with the final hit or a terminal signal
+  int64 nodes_visited = 5;
+  int64 search_time_ms = 6;
 }
 
-message ThresholdUpdate {
+message CoordinateRequest {
   string query_id = 1;
   float min_score = 2;
+  bytes neighborhood_hint = 3; // 1024-bit binary signature
+}
+
+message CoordinateResponse {
+  string query_id = 1;
+  float min_score = 2;
+  bytes neighborhood_hint = 3; // 1024-bit binary signature
 }

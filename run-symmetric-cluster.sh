@@ -2,9 +2,16 @@
 # run-symmetric-cluster.sh - Launch 8 identical Symmetric Peers locally
 # Unified Vert.x server: single port per node serves both HTTP REST and gRPC (HTTP/2)
 
-export JAVA_HOME="/home/krickert/.sdkman/candidates/java/25.0.2-tem"
 CDIR=$(pwd)
-INDEX_BASE="${KNN_INDEX_BASE:-/work/opensearch-grpc-knn/distributed-search/shards-8-new}"
+INDEX_BASE="${KNN_INDEX_BASE:-./shards-8-new}"
+KNN_NODE_XMS="${KNN_NODE_XMS:-8g}"
+KNN_NODE_XMX="${KNN_NODE_XMX:-8g}"
+# Lucene Vector API acceleration (recommended by startup warning)
+KNN_VECTOR_OPTS="${KNN_VECTOR_OPTS:---add-modules=jdk.incubator.vector}"
+# Optional: suppress native access warning from Lucene native access calls
+KNN_NATIVE_OPTS="${KNN_NATIVE_OPTS:---enable-native-access=ALL-UNNAMED}"
+# Optional collaborative-bar tuning knobs (defaults are in Lucene code).
+KNN_COLLAB_JVM_OPTS="${KNN_COLLAB_JVM_OPTS:-}"
 
 # 1. Build the single Uber-App
 echo "Building knn-node..."
@@ -13,6 +20,7 @@ cd knn-node
 cd ..
 
 echo "Using shard index base: $INDEX_BASE"
+echo "Node JVM opts: -Xms$KNN_NODE_XMS -Xmx$KNN_NODE_XMX $KNN_VECTOR_OPTS $KNN_NATIVE_OPTS $KNN_COLLAB_JVM_OPTS"
 
 # 2. Start 8 Nodes (single port per node: HTTP + gRPC on same port)
 for i in {0..7}
@@ -22,6 +30,11 @@ do
     echo "Starting Node-$i (HTTP+gRPC: $PORT)..."
 
     java \
+        -Xms$KNN_NODE_XMS \
+        -Xmx$KNN_NODE_XMX \
+        $KNN_VECTOR_OPTS \
+        $KNN_NATIVE_OPTS \
+        $KNN_COLLAB_JVM_OPTS \
         -Dquarkus.http.port=$PORT \
         -Dknn.shard.id=$i \
         -Dknn.index.path="$INDEX_BASE/shard-$i" \
