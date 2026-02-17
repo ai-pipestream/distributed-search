@@ -24,15 +24,12 @@ import org.jboss.logging.Logger;
 
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
-import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAccumulator;
 import java.util.stream.Collectors;
 
@@ -129,10 +126,10 @@ public class KnnResource {
                 .setCollaborative(collaborative)
                 .build();
 
-        // SHARED ACCUMULATOR: Tracks the best scores found by ANY shard
+        // RELAY ARCHITECTURE: No leader-side heap during search - avoid synchronized bottleneck.
+        // Track best scores for floor broadcast; build Top-K only at end from collected hits.
         LongAccumulator globalBestAcc = collaborative
                 ? new LongAccumulator(Long::max, Long.MIN_VALUE) : null;
-        
         BroadcastProcessor<CoordinateRequest> coordinatorBroadcaster = BroadcastProcessor.create();
         List<KnnNodeService.SearchHit> resultHits = new ArrayList<>();
 
@@ -142,7 +139,7 @@ public class KnnResource {
         allStreams.add(localService.search(request)
                 .onItem().invoke(hit -> {
                     if (hit.getGlobalId() < Long.MAX_VALUE - 100 && hit.getGlobalId() != 0) {
-                        synchronized(resultHits) { resultHits.add(new KnnNodeService.SearchHit(hit.getGlobalId(), hit.getScore(), hit.getChunk())); }
+                        synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(hit.getGlobalId(), hit.getScore(), hit.getChunk())); }
                         if (collaborative) relayCoordination(queryId, hit.getScore(), globalBestAcc, coordinatorBroadcaster);
                     }
                 }));
@@ -162,13 +159,13 @@ public class KnnResource {
         return aggregateFirehoses(allStreams, resultHits, k, queryId, globalBestAcc != null);
     }
 
-    private void relayCoordination(String qid, float score, LongAccumulator bestAcc, BroadcastProcessor<CoordinateRequest> broadcaster) {
+    /** Relay: when a better score is seen, broadcast to all shards. No heap - lightweight. */
+    private void relayCoordination(String qid, float score, LongAccumulator bestAcc,
+                                  BroadcastProcessor<CoordinateRequest> broadcaster) {
         if (bestAcc == null) return;
         long encoded = CollaborativeKnnCollector.encode(Integer.MAX_VALUE, score);
         long old = bestAcc.get();
         bestAcc.accumulate(encoded);
-        
-        // RELAY: If this hit is better than what we've seen, tell everyone!
         if (bestAcc.get() > old) {
             broadcaster.onNext(CoordinateRequest.newBuilder()
                     .setQueryId(qid)
@@ -180,7 +177,7 @@ public class KnnResource {
     private Multi<SearchResponse> callPeerStreaming(
             String host, int port, SearchRequest request,
             List<KnnNodeService.SearchHit> resultHits,
-            LongAccumulator bestAcc, 
+            LongAccumulator bestAcc,
             BroadcastProcessor<CoordinateRequest> broadcaster) {
 
         MutinyKnnNodeServiceGrpc.MutinyKnnNodeServiceStub peer = MutinyKnnNodeServiceGrpc.newMutinyStub(
@@ -190,13 +187,13 @@ public class KnnResource {
 
         peer.coordinate(outboundCoordination)
                 .subscribe().with(resp -> {
-                    relayCoordination(request.getQueryId(), resp.getMinScore(), bestAcc, broadcaster);
+                    if (bestAcc != null) relayCoordination(request.getQueryId(), resp.getMinScore(), bestAcc, broadcaster);
                 }, err -> {});
 
         return peer.search(request)
                 .onItem().invoke(hit -> {
                     if (hit.getGlobalId() < Long.MAX_VALUE - 100 && hit.getGlobalId() != 0) {
-                        synchronized(resultHits) { resultHits.add(new KnnNodeService.SearchHit(hit.getGlobalId(), hit.getScore(), hit.getChunk())); }
+                        synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(hit.getGlobalId(), hit.getScore(), hit.getChunk())); }
                         if (bestAcc != null) relayCoordination(request.getQueryId(), hit.getScore(), bestAcc, broadcaster);
                     }
                 });
@@ -219,17 +216,16 @@ public class KnnResource {
                 .collect().last() 
                 .ifNoItem().after(Duration.ofSeconds(30)).fail()
                 .onItem().transform(ignored -> {
-                    // Final Top-K calculation happens ONLY ONCE at the end
-                    List<KnnNodeService.SearchHit> finalSorted;
-                    synchronized(resultHits) {
-                        finalSorted = resultHits.stream()
-                            .sorted(Comparator.comparing((KnnNodeService.SearchHit h) -> h.score).reversed())
-                            .limit(k)
-                            .collect(Collectors.toList());
+                    List<KnnNodeService.SearchHit> sortedResults;
+                    synchronized (resultHits) {
+                        sortedResults = new ArrayList<>(resultHits);
                     }
+                    sortedResults.sort((a, b) -> Float.compare(b.score, a.score));
+                    List<KnnNodeService.SearchHit> topK = sortedResults.size() > k
+                            ? new ArrayList<>(sortedResults.subList(0, k)) : new ArrayList<>(sortedResults);
                     LOG.infof("Query %s COMPLETE. Hits=%d, Shards=%d, Visited=%d", 
-                        qid, finalSorted.size(), finishedShards.get(), totalVisited.get());
-                    return new SearchResult(finalSorted, totalVisited.get(), System.currentTimeMillis() - startTime, collaborative);
+                        qid, topK.size(), finishedShards.get(), totalVisited.get());
+                    return new SearchResult(topK, totalVisited.get(), System.currentTimeMillis() - startTime, collaborative);
                 });
     }
 

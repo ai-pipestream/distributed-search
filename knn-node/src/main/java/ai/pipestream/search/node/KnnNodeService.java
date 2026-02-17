@@ -225,19 +225,13 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 float oldVal = CollaborativeKnnCollector.toScore(acc.get());
                 acc.accumulate(CollaborativeKnnCollector.encode(Integer.MAX_VALUE, update.getMinScore()));
                 float newVal = CollaborativeKnnCollector.toScore(acc.get());
-                
-                // Update local hint from Leader's global hint
-                if (!update.getNeighborhoodHint().isEmpty() && hintRef != null) {
-                    hintRef.set(update.getNeighborhoodHint().toByteArray());
-                }
-
                 if (newVal > oldVal) {
                     LOG.infof("[DIAGNOSTIC] Query %s updated local floor to GLOBAL value: %.6f (Visited so far: %d)", 
                         qid, newVal, visits != null ? visits.get() : -1);
                 }
             }
             
-            float floor = 0.0f;
+            float floor = Float.NEGATIVE_INFINITY;
             if (acc != null) {
                 long current = acc.get();
                 if (current != Long.MIN_VALUE) {
