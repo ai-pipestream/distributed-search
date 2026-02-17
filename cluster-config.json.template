@@ -1,0 +1,9 @@
+{
+  "nodes": [
+    {"host": "node-1", "ip": "10.0.0.1", "shard": 0, "role": "seed",     "mem": "12g"},
+    {"host": "node-2", "ip": "10.0.0.2", "shard": 1, "role": "follower", "mem": "6g"}
+  ],
+  "seed_ip": "10.0.0.1",
+  "seed_port": 4900,
+  "djl_url": "http://localhost:8091"
+}

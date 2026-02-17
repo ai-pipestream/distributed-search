@@ -14,6 +14,9 @@ knn-node/build/
 # Logs
 *.log
 
+# Configuration
+cluster-config.json
+
 # Index data (too large for git)
 shards-*/
 index/
