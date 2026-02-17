@@ -129,13 +129,12 @@ public class KnnResource {
                 .setCollaborative(collaborative)
                 .build();
 
-        // HEAP FLOOR BROADCASTER: Share the k-th best score globally
-        LongAccumulator globalFloorAcc = collaborative
+        // SHARED ACCUMULATOR: Tracks the best scores found by ANY shard
+        LongAccumulator globalBestAcc = collaborative
                 ? new LongAccumulator(Long::max, Long.MIN_VALUE) : null;
         
-        AtomicReference<byte[]> globalHint = new AtomicReference<>(null);
         BroadcastProcessor<CoordinateRequest> coordinatorBroadcaster = BroadcastProcessor.create();
-        PriorityQueue<KnnNodeService.SearchHit> topKHeap = new PriorityQueue<>(k, Comparator.comparing(h -> h.score));
+        List<KnnNodeService.SearchHit> resultHits = new ArrayList<>();
 
         List<Multi<SearchResponse>> allStreams = new ArrayList<>();
 
@@ -143,7 +142,8 @@ public class KnnResource {
         allStreams.add(localService.search(request)
                 .onItem().invoke(hit -> {
                     if (hit.getGlobalId() < Long.MAX_VALUE - 100 && hit.getGlobalId() != 0) {
-                        processHit(queryId, hit, k, topKHeap, globalFloorAcc, globalHint, coordinatorBroadcaster);
+                        synchronized(resultHits) { resultHits.add(new KnnNodeService.SearchHit(hit.getGlobalId(), hit.getScore(), hit.getChunk())); }
+                        if (collaborative) relayCoordination(queryId, hit.getScore(), globalBestAcc, coordinatorBroadcaster);
                     }
                 }));
 
@@ -153,78 +153,61 @@ public class KnnResource {
                     .onItem().transformToUni(instances -> {
                         List<ServiceInstance> selectedPeers = selectPeers(instances, maxPeers);
                         for (ServiceInstance si : selectedPeers) {
-                            allStreams.add(callPeerStreaming(si.getHost(), si.getPort(), k, request, topKHeap, globalFloorAcc, globalHint, coordinatorBroadcaster));
+                            allStreams.add(callPeerStreaming(si.getHost(), si.getPort(), request, resultHits, globalBestAcc, coordinatorBroadcaster));
                         }
-                        return aggregateFirehoses(allStreams, topKHeap, k, queryId, globalFloorAcc);
+                        return aggregateFirehoses(allStreams, resultHits, k, queryId, globalBestAcc != null);
                     });
         }
 
-        return aggregateFirehoses(allStreams, topKHeap, k, queryId, globalFloorAcc);
+        return aggregateFirehoses(allStreams, resultHits, k, queryId, globalBestAcc != null);
     }
 
-    private void processHit(String qid, SearchResponse hit, int k, 
-                          PriorityQueue<KnnNodeService.SearchHit> heap,
-                          LongAccumulator floorAcc, AtomicReference<byte[]> globalHint,
-                          BroadcastProcessor<CoordinateRequest> broadcaster) {
+    private void relayCoordination(String qid, float score, LongAccumulator bestAcc, BroadcastProcessor<CoordinateRequest> broadcaster) {
+        if (bestAcc == null) return;
+        long encoded = CollaborativeKnnCollector.encode(Integer.MAX_VALUE, score);
+        long old = bestAcc.get();
+        bestAcc.accumulate(encoded);
         
-        KnnNodeService.SearchHit sh = new KnnNodeService.SearchHit(hit.getGlobalId(), hit.getScore(), hit.getChunk());
-        
-        synchronized (heap) {
-            heap.offer(sh);
-            if (heap.size() > k) {
-                heap.poll();
-            }
-            
-            // If the heap is full, the head of the heap is our GLOBAL FLOOR
-            if (heap.size() == k && floorAcc != null) {
-                float currentFloor = heap.peek().score;
-                long encoded = CollaborativeKnnCollector.encode(Integer.MAX_VALUE, currentFloor);
-                long old = floorAcc.get();
-                floorAcc.accumulate(encoded);
-                
-                if (floorAcc.get() > old) {
-                    broadcaster.onNext(CoordinateRequest.newBuilder()
-                            .setQueryId(qid)
-                            .setMinScore(currentFloor)
-                            .build());
-                }
-            }
+        // RELAY: If this hit is better than what we've seen, tell everyone!
+        if (bestAcc.get() > old) {
+            broadcaster.onNext(CoordinateRequest.newBuilder()
+                    .setQueryId(qid)
+                    .setMinScore(score)
+                    .build());
         }
     }
 
     private Multi<SearchResponse> callPeerStreaming(
-            String host, int port, int k, SearchRequest request,
-            PriorityQueue<KnnNodeService.SearchHit> heap,
-            LongAccumulator floorAcc, AtomicReference<byte[]> globalHint, 
+            String host, int port, SearchRequest request,
+            List<KnnNodeService.SearchHit> resultHits,
+            LongAccumulator bestAcc, 
             BroadcastProcessor<CoordinateRequest> broadcaster) {
 
         MutinyKnnNodeServiceGrpc.MutinyKnnNodeServiceStub peer = MutinyKnnNodeServiceGrpc.newMutinyStub(
                 channelCache.getOrCreate(host, port));
 
-        Multi<CoordinateRequest> outboundCoordination = broadcaster
-                .onOverflow().drop();
+        Multi<CoordinateRequest> outboundCoordination = broadcaster.onOverflow().drop();
 
         peer.coordinate(outboundCoordination)
                 .subscribe().with(resp -> {
-                    // Peers can also contribute to global floor if they find better hits
-                    // For now, we trust the Leader's heap as the source of truth for the floor
+                    relayCoordination(request.getQueryId(), resp.getMinScore(), bestAcc, broadcaster);
                 }, err -> {});
 
         return peer.search(request)
                 .onItem().invoke(hit -> {
                     if (hit.getGlobalId() < Long.MAX_VALUE - 100 && hit.getGlobalId() != 0) {
-                        processHit(request.getQueryId(), hit, k, heap, floorAcc, globalHint, broadcaster);
+                        synchronized(resultHits) { resultHits.add(new KnnNodeService.SearchHit(hit.getGlobalId(), hit.getScore(), hit.getChunk())); }
+                        if (bestAcc != null) relayCoordination(request.getQueryId(), hit.getScore(), bestAcc, broadcaster);
                     }
                 });
     }
 
     private Uni<SearchResult> aggregateFirehoses(List<Multi<SearchResponse>> streams, 
-                                               PriorityQueue<KnnNodeService.SearchHit> topKHeap,
-                                               int k, String qid, LongAccumulator floorAcc) {
+                                               List<KnnNodeService.SearchHit> resultHits,
+                                               int k, String qid, boolean collaborative) {
         long startTime = System.currentTimeMillis();
         AtomicLong totalVisited = new AtomicLong(0);
         AtomicInteger finishedShards = new AtomicInteger(0);
-        int expectedShards = streams.size();
 
         return Multi.createBy().merging().streams(streams)
                 .onItem().invoke(hit -> {
@@ -236,11 +219,17 @@ public class KnnResource {
                 .collect().last() 
                 .ifNoItem().after(Duration.ofSeconds(30)).fail()
                 .onItem().transform(ignored -> {
-                    List<KnnNodeService.SearchHit> sortedResults = new ArrayList<>(topKHeap);
-                    sortedResults.sort((a, b) -> Float.compare(b.score, a.score));
+                    // Final Top-K calculation happens ONLY ONCE at the end
+                    List<KnnNodeService.SearchHit> finalSorted;
+                    synchronized(resultHits) {
+                        finalSorted = resultHits.stream()
+                            .sorted(Comparator.comparing((KnnNodeService.SearchHit h) -> h.score).reversed())
+                            .limit(k)
+                            .collect(Collectors.toList());
+                    }
                     LOG.infof("Query %s COMPLETE. Hits=%d, Shards=%d, Visited=%d", 
-                        qid, sortedResults.size(), finishedShards.get(), totalVisited.get());
-                    return new SearchResult(sortedResults, totalVisited.get(), System.currentTimeMillis() - startTime, floorAcc != null);
+                        qid, finalSorted.size(), finishedShards.get(), totalVisited.get());
+                    return new SearchResult(finalSorted, totalVisited.get(), System.currentTimeMillis() - startTime, collaborative);
                 });
     }
 
