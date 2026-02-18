@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -60,6 +61,29 @@ public class KnnResource {
 
     @Inject
     GrpcChannelCache channelCache;
+
+    @GET
+    @Path("/smoke")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Uni<SearchResult> smokeSearch(
+            @QueryParam("k") @DefaultValue("10") int k,
+            @QueryParam("collaborative") @DefaultValue("true") boolean collaborative) {
+        final int topK = k < 1 ? 10 : k;
+        // Generate a deterministic random query vector matching the index dimension
+        Random r = new Random(12345);
+        List<Float> vector = new ArrayList<>(128);
+        float norm = 0;
+        float[] raw = new float[128];
+        for (int i = 0; i < 128; i++) {
+            raw[i] = r.nextFloat();
+            norm += raw[i] * raw[i];
+        }
+        norm = (float) Math.sqrt(norm);
+        for (int i = 0; i < 128; i++) {
+            vector.add(raw[i] / norm);
+        }
+        return leaderSearch(topK, vector, collaborative, -1, -1);
+    }
 
     @GET
     @Path("/text")

@@ -21,6 +21,7 @@ dependencies {
     implementation 'io.quarkus:quarkus-arc'
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-smallrye-health'
+    implementation 'io.quarkus:quarkus-scheduler'
     implementation files('/work/opensearch-grpc-knn/lucene/lucene/core/build/libs/lucene-core-11.0.0-SNAPSHOT.jar')
     testImplementation 'io.quarkus:quarkus-junit'
     testImplementation 'io.rest-assured:rest-assured'
@@ -41,4 +42,18 @@ compileJava {
 
 compileTestJava {
     options.encoding = 'UTF-8'
+}
+
+// Lucene needs vector API and native access for optimal HNSW performance
+def luceneJvmArgs = [
+    '--add-modules', 'jdk.incubator.vector',
+    '--enable-native-access=ALL-UNNAMED'
+]
+
+test {
+    jvmArgs luceneJvmArgs
+}
+
+quarkusDev {
+    jvmArgs = luceneJvmArgs
 }

@@ -26,7 +26,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
 
 @QuarkusTest
-@QuarkusTestResource(KnnNodeTest.IndexResource.class)
+@QuarkusTestResource(value = KnnNodeTest.IndexResource.class, restrictToAnnotatedClass = true)
 public class KnnNodeTest {
 
     /**
@@ -60,7 +60,8 @@ public class KnnNodeTest {
             return Map.of(
                     "knn.index.path", tempIndexDir.toAbsolutePath().toString(),
                     "knn.shard.id", "0",
-                    "knn.single.node", "true"
+                    "knn.single.node", "true",
+                    "quarkus.http.test-port", "0"
             );
         }
 

@@ -19,6 +19,9 @@ message SearchRequest {
   repeated float vector = 2;
   int32 k = 3;
   bool collaborative = 4;
+  // Optional collection name. If set, searches within the named collection.
+  // If empty, falls back to legacy knn.index.path config.
+  string collection = 5;
 }
 
 message SearchResponse {

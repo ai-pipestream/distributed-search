@@ -8,6 +8,8 @@ import io.smallrye.mutiny.subscription.MultiEmitter;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Singleton;
 import ai.pipestream.search.grpc.*;
+import ai.pipestream.search.index.CollectionManager;
+import jakarta.inject.Inject;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.LeafReaderContext;
@@ -41,6 +43,9 @@ import java.util.concurrent.atomic.LongAccumulator;
 public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService {
 
     private static final Logger LOG = Logger.getLogger(KnnNodeService.class);
+
+    @Inject
+    CollectionManager collectionManager;
 
     private final Map<String, LongAccumulator> localSearches = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> searchVisits = new ConcurrentHashMap<>();
@@ -126,11 +131,15 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
         String path = resolveIndexPath();
         int shardId = resolveShardId();
         LOG.infof("=== KNN Node Starting (Shard: %d) ===", shardId);
+        if ("NONE".equals(path)) {
+            LOG.info("No legacy index path configured. Collections-only mode.");
+            return;
+        }
         try (DirectoryReader reader = DirectoryReader.open(FSDirectory.open(Path.of(path)))) {
             indexVectorDimension = resolveIndexVectorDimension(reader);
             LOG.infof("SUCCESS: Index loaded. Contains %d documents, dim=%d.", reader.numDocs(), indexVectorDimension);
         } catch (Exception e) {
-            LOG.errorf("CRITICAL: Failed to load index at %s: %s", path, e.getMessage());
+            LOG.warnf("No legacy index at %s: %s (this is OK if using collections)", path, e.getMessage());
         }
     }
 
@@ -158,14 +167,26 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 searchHints.put(qid, hint);
             }
 
-            try (DirectoryReader reader = DirectoryReader.open(FSDirectory.open(Path.of(path)))) {
-                IndexSearcher searcher = new IndexSearcher(reader);
+            DirectoryReader reader = null;
+            boolean ownsReader = false;
+            try {
+                // Open reader: from CollectionManager if collection specified, else legacy path
+                String collectionName = request.getCollection();
+                if (!collectionName.isEmpty()) {
+                    reader = collectionManager.getReader(collectionName, shardId);
+                    ownsReader = false; // CollectionManager owns it
+                } else {
+                    reader = DirectoryReader.open(FSDirectory.open(Path.of(path)));
+                    ownsReader = true;
+                }
+                final DirectoryReader theReader = reader;
+                IndexSearcher searcher = new IndexSearcher(theReader);
                 float[] vector = new float[request.getVectorCount()];
                 for (int i = 0; i < request.getVectorCount(); i++) vector[i] = request.getVector(i);
 
                 KnnCollectorManager manager;
                 if (request.getCollaborative()) {
-                    manager = new CollaborativeKnnCollectorManager(internalK, acc, hint);
+                    manager = new CollaborativeKnnCollectorManager(internalK, acc);
                 } else {
                     manager = new TopKnnCollectorManager(internalK, searcher);
                 }
@@ -173,8 +194,8 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 KnnCollectorManager streamingManager = new KnnCollectorManager() {
                     @Override
                     public KnnCollector newCollector(int ignored, KnnSearchStrategy strategy, LeafReaderContext context) throws IOException {
-                        return new StreamingKnnCollector(manager.newCollector(visitLimit, strategy, context), 
-                                                       emitter, shardId, reader.storedFields(), reader.leaves(), visits, hint, request.getK());
+                        return new StreamingKnnCollector(manager.newCollector(visitLimit, strategy, context),
+                                                       emitter, shardId, theReader.storedFields(), theReader.leaves(), visits, hint, request.getK());
                     }
                 };
 
@@ -201,6 +222,9 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 LOG.errorf(e, "Search failed for query %s", qid);
                 emitter.fail(e);
             } finally {
+                if (ownsReader) {
+                    try { reader.close(); } catch (IOException ignored) {}
+                }
                 if (emitter.isCancelled()) {
                     LOG.warnf("[DIAGNOSTIC] Query %s was CANCELLED by gRPC before completion!", qid);
                 }

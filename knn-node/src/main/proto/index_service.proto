@@ -1,0 +1,157 @@
+syntax = "proto3";
+
+package ai.pipestream.index.v1;
+
+option java_multiple_files = true;
+option java_package = "ai.pipestream.index.v1";
+
+// Service for indexing documents into the vector search engine.
+service IndexService {
+  // Index a single document (unary).
+  rpc IndexDocument (IndexDocumentRequest) returns (IndexDocumentResponse);
+
+  // Stream documents for indexing — low memory footprint, backpressure-aware.
+  // Client streams documents, server streams per-doc acks (bidi).
+  rpc StreamIndex (stream IndexDocumentRequest) returns (stream IndexDocumentResponse);
+
+  // Delete a document by ID.
+  rpc DeleteDocument (DeleteDocumentRequest) returns (DeleteDocumentResponse);
+
+  // Collection lifecycle management.
+  rpc CreateCollection (CreateCollectionRequest) returns (CreateCollectionResponse);
+  rpc GetCollection (GetCollectionRequest) returns (GetCollectionResponse);
+  rpc ListCollections (ListCollectionsRequest) returns (ListCollectionsResponse);
+  rpc DeleteCollection (DeleteCollectionRequest) returns (DeleteCollectionResponse);
+}
+
+// Request to index a single document.
+message IndexDocumentRequest {
+  // Target collection name.
+  string collection = 1;
+  // Unique document identifier.
+  string doc_id = 2;
+  // Content: provide text, vector, or both.
+  // If only text is provided, the server embeds it via the collection's configured model.
+  oneof content {
+    // Raw text to embed server-side.
+    string text = 3;
+    // Pre-computed embedding vector.
+    VectorContent vector = 4;
+    // Both text and pre-computed vector.
+    TextAndVector text_and_vector = 5;
+  }
+  // The chunk/passage text to store for retrieval (separate from embedding input).
+  string chunk_text = 6;
+  // Arbitrary key-value metadata (all stored as Lucene StoredFields).
+  map<string, string> metadata = 7;
+}
+
+// Pre-computed vector embedding.
+message VectorContent {
+  repeated float values = 1;
+}
+
+// Both text and pre-computed vector in one request.
+message TextAndVector {
+  string text = 1;
+  repeated float vector = 2;
+}
+
+// Response for a single indexed document.
+message IndexDocumentResponse {
+  // Whether the document was successfully indexed.
+  bool success = 1;
+  // The document ID that was indexed.
+  string doc_id = 2;
+  // Which shard received the document.
+  int32 shard_id = 3;
+  // Error message if success is false.
+  string error = 4;
+}
+
+// Request to delete a document.
+message DeleteDocumentRequest {
+  string collection = 1;
+  string doc_id = 2;
+}
+
+// Response for document deletion.
+message DeleteDocumentResponse {
+  bool found = 1;
+}
+
+// Supported vector similarity functions.
+enum VectorSimilarity {
+  // Unspecified defaults to COSINE.
+  VECTOR_SIMILARITY_UNSPECIFIED = 0;
+  VECTOR_SIMILARITY_COSINE = 1;
+  VECTOR_SIMILARITY_DOT_PRODUCT = 2;
+  VECTOR_SIMILARITY_EUCLIDEAN = 3;
+}
+
+// Request to create a new collection.
+message CreateCollectionRequest {
+  // Collection name (must be unique, lowercase alphanumeric + hyphens).
+  string name = 1;
+  // Vector dimensionality (e.g., 384, 1024).
+  int32 vector_dimension = 2;
+  // Similarity function for vector comparisons.
+  VectorSimilarity similarity = 3;
+  // Number of shards (defaults to 1 if unset).
+  int32 num_shards = 4;
+  // DJL model name for server-side embedding (e.g., "bge_m3").
+  // Required if clients will send text without pre-computed vectors.
+  string embedding_model = 5;
+}
+
+// Response after creating a collection.
+message CreateCollectionResponse {
+  CollectionInfo collection = 1;
+}
+
+// Request to get collection info.
+message GetCollectionRequest {
+  string name = 1;
+}
+
+// Response with collection info.
+message GetCollectionResponse {
+  CollectionInfo collection = 1;
+}
+
+// Request to list all collections.
+message ListCollectionsRequest {}
+
+// Response listing all collections.
+message ListCollectionsResponse {
+  repeated CollectionInfo collections = 1;
+}
+
+// Request to delete a collection.
+message DeleteCollectionRequest {
+  string name = 1;
+}
+
+// Response after deleting a collection.
+message DeleteCollectionResponse {
+  bool success = 1;
+}
+
+// Metadata about a collection.
+message CollectionInfo {
+  string name = 1;
+  int32 vector_dimension = 2;
+  VectorSimilarity similarity = 3;
+  int32 num_shards = 4;
+  int64 total_docs = 5;
+  string embedding_model = 6;
+  repeated ShardInfo shards = 7;
+}
+
+// Metadata about a single shard within a collection.
+message ShardInfo {
+  int32 shard_id = 1;
+  int64 num_docs = 2;
+  string host = 3;
+  int32 port = 4;
+}
