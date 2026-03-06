@@ -10,18 +10,39 @@ This creates the **"RAG Chunking Tax"**:
 
 ## The Strategy: Multi-Vector Short-Circuit
 
-By leveraging Lucene's internal `ordToDoc` mapping, we can pivot the search engine to be **Document-Aware** during the HNSW traversal itself.
+By leveraging Lucene's internal `ordToDoc` mapping, we can pivot the search engine to be **Document-Aware** during the HNSW traversal itself. This is particularly effective when used with the recently introduced **LateInteractionField**, which stores multi-vector matrices (tensors) in a single DocValue payload.
 
 ### 1. The `DistinctDocKnnCollector`
 Instead of a simple heap of vectors, we implement a collector that understands the 1:N relationship between Documents and Ordinals. 
-*   It tracks the **Top-K Distinct Documents**.
-*   It maintains a "Satisfied" set of DocIDs that have already reached a similarity threshold sufficient for the current Top-K.
+*   **Ordinal-to-Doc Mapping**: The collector is initialized with `KnnVectorValues` for the segment, allowing it to call `ordToDoc(ordinal)` for any candidate.
+*   **Top-K Distinct Documents**: It tracks the best score for each unique DocID encountered.
+*   **Satisfied Set**: It maintains a bitset or hash-set of "Satisfied" DocIDs that have already secured a place in the global Top-K with a sufficiently high score.
 
-### 2. Immediate Graph Pruning
-When the `HnswGraphSearcher` encounters a new candidate ordinal $O$:
-1.  **Lookup**: $D = ordToDoc(O)$.
-2.  **Check**: If $D$ is already in the "Satisfied" set with a score $S' \ge S_{current}$, the searcher **ABORTS** immediately.
-3.  **Action**: No floating-point math is performed for the vector; no neighbors are added to the candidate queue; the branch is pruned.
+### 2. Implementation: `HnswGraphSearcher` Hook
+We introduce a new method or a check within the `searchLevel` loop of `HnswGraphSearcher`:
+
+```java
+// Inside HnswGraphSearcher#searchLevel while loop
+while ((friendOrd = graphNextNeighbor(graph)) != NO_MORE_DOCS) {
+    if (visited.getAndSet(friendOrd)) continue;
+    
+    // NEW: Short-circuit check before scoring
+    if (results instanceof DocAwareKnnCollector docCollector) {
+        if (docCollector.isDocSatisfied(friendOrd)) {
+            // Skip scoring and neighbor addition for this branch
+            continue; 
+        }
+    }
+    
+    bulkNodes[numNodes++] = friendOrd;
+}
+```
+
+### 3. Tying in Tensor Features (LateInteractionField)
+Lucene's `LateInteractionField` allows storing $N$ vectors for a single document. Our strategy introduces these chunks into the HNSW index such that:
+*   Each chunk (row in the tensor) is assigned a unique **Ordinal** in the HNSW graph.
+*   All $N$ ordinals for a document map to the **same DocID** via `ordToDoc`.
+*   The `DistinctDocKnnCollector` uses this mapping to ensure that once *any* chunk of Document $X$ hits the global threshold, all other $N-1$ chunks of Document $X$ are instantly pruned from the search frontier.
 
 ## The "Stronger" Factor: Collaborative Synergy
 
