@@ -36,3 +36,18 @@ This is not a static centroid model; it's a dynamic, living index.
 
 ## The Result: A True "RAG Index"
 This creates an index where **Document Similarity is defined by Chunk Connectivity.** It solves the "Needle in the Haystack" problem because the exact, high-fidelity vectors are preserved (no centroids), but the pathways *between* them are optimized for diverse document retrieval.
+
+## Research Context & Novelty
+This "Two-Pass" indexing strategy represents a novel intersection of graph theory and multi-vector retrieval (MVR) paradigms.
+
+### 1. Distinction from Search-Time Deduplication (e.g., Vespa)
+While modern systems like **Vespa** implement document-centric retrieval by modifying the HNSW search loop (stopping after $K$ unique `docids`), they still operate on a standard, vector-centric graph.
+*   **The Difference:** Our approach optimizes at **Indexing Time**. By re-wiring the graph in Pass 2, we change the **Graph Topology** to favor cross-document navigation. This prevents the searcher from getting "trapped" in a dense single-document cluster, rather than simply deduplicating the results once the trap has already been sprung.
+
+### 2. Metadata-Driven Edge Diversification
+Standard HNSW uses a distance-based diversity heuristic (don't connect to a neighbor if a closer one already exists).
+*   **The Innovation:** We introduce a **Metadata Constraint** to this heuristic. In Pass 2, the graph is actively re-engineered to maintain "Document Diversity." The graph edges act as a **Semantic Highway** between distinct source documents, ensuring that even in highly redundant chunked datasets, the search frontier always points toward new information sources.
+
+### 3. Solving the MaxSim Recall Risk
+Existing research (e.g., **Col-Bandit**) attempts to prune search based on score uncertainty.
+*   **Our Solution:** By focusing on **Navigation (Topology)** rather than **Math (Pruning)**, we maintain bit-identical MaxSim parity. We aren't skipping the calculation; we are ensuring that the HNSW searcher is naturally "pushed" toward chunks of different documents, making the traversal itself document-aware without sacrificing absolute recall.
