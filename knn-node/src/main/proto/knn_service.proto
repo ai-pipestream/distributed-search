@@ -25,14 +25,22 @@ message SearchRequest {
 }
 
 message SearchResponse {
+  oneof payload {
+    SearchHit hit = 1;       // Streamed as each match is found
+    SearchDebug debug = 2;   // Terminal or periodic (nodes_visited, search_time_ms)
+  }
+}
+
+message SearchHit {
   int64 global_id = 1;
   float score = 2;
   string chunk = 3;
   repeated float vector = 4;
-  
-  // Optional metadata sent with the final hit or a terminal signal
-  int64 nodes_visited = 5;
-  int64 search_time_ms = 6;
+}
+
+message SearchDebug {
+  int64 nodes_visited = 1;
+  int64 search_time_ms = 2;
 }
 
 message CoordinateRequest {

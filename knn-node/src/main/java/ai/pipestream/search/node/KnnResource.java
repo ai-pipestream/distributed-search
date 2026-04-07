@@ -67,7 +67,8 @@ public class KnnResource {
     @Produces(MediaType.APPLICATION_JSON)
     public Uni<SearchResult> smokeSearch(
             @QueryParam("k") @DefaultValue("10") int k,
-            @QueryParam("collaborative") @DefaultValue("true") boolean collaborative) {
+            @QueryParam("collaborative") @DefaultValue("true") boolean collaborative,
+            @QueryParam("collection") @DefaultValue("") String collection) {
         final int topK = k < 1 ? 10 : k;
         // Generate a deterministic random query vector matching the index dimension
         Random r = new Random(12345);
@@ -82,7 +83,7 @@ public class KnnResource {
         for (int i = 0; i < 128; i++) {
             vector.add(raw[i] / norm);
         }
-        return leaderSearch(topK, vector, collaborative, -1, -1);
+        return leaderSearch(topK, vector, collaborative, -1, -1, collection);
     }
 
     @GET
@@ -92,7 +93,8 @@ public class KnnResource {
             @QueryParam("k") @DefaultValue("10") int k,
             @QueryParam("collaborative") @DefaultValue("true") boolean collaborative,
             @QueryParam("maxPeers") @DefaultValue("-1") int maxPeers,
-            @QueryParam("perShardK") @DefaultValue("-1") int perShardK) {
+            @QueryParam("perShardK") @DefaultValue("-1") int perShardK,
+            @QueryParam("collection") @DefaultValue("") String collection) {
         final int topK = k < 1 ? 10 : k;
         String formattedQuery = queryPrefix + text;
         return djlService.getEmbeddingsRaw(List.of(formattedQuery))
@@ -101,7 +103,7 @@ public class KnnResource {
                     if (embeddings.isEmpty()) {
                         return Uni.createFrom().failure(new IllegalStateException("No embeddings from DJL"));
                     }
-                    return leaderSearch(topK, embeddings.get(0), collaborative, maxPeers, perShardK);
+                    return leaderSearch(topK, embeddings.get(0), collaborative, maxPeers, perShardK, collection);
                 });
     }
 
@@ -112,7 +114,8 @@ public class KnnResource {
             @QueryParam("q") String text,
             @QueryParam("k") @DefaultValue("100") int k,
             @QueryParam("maxPeers") @DefaultValue("-1") int maxPeers,
-            @QueryParam("perShardK") @DefaultValue("-1") int perShardK) {
+            @QueryParam("perShardK") @DefaultValue("-1") int perShardK,
+            @QueryParam("collection") @DefaultValue("") String collection) {
         final int topK = k < 1 ? 100 : k;
         String formattedQuery = queryPrefix + text;
         LOG.infof("Comparison search: [%s] k=%d", formattedQuery, topK);
@@ -124,8 +127,8 @@ public class KnnResource {
                         return Uni.createFrom().failure(new IllegalStateException("No embeddings from DJL"));
                     }
                     List<Float> vector = embeddings.get(0);
-                    return leaderSearch(topK, vector, false, maxPeers, perShardK)
-                            .onItem().transformToUni(stdResult -> leaderSearch(topK, vector, true, maxPeers, perShardK)
+                    return leaderSearch(topK, vector, false, maxPeers, perShardK, collection)
+                            .onItem().transformToUni(stdResult -> leaderSearch(topK, vector, true, maxPeers, perShardK, collection)
                                     .onItem().transform(collabResult ->
                                             buildComparison(stdResult, collabResult, topK)));
                 });
@@ -137,18 +140,22 @@ public class KnnResource {
             List<Float> vector,
             @QueryParam("collaborative") @DefaultValue("true") boolean collaborative,
             @QueryParam("maxPeers") @DefaultValue("-1") int maxPeers,
-            @QueryParam("perShardK") @DefaultValue("-1") int perShardK) {
-        
+            @QueryParam("perShardK") @DefaultValue("-1") int perShardK,
+            @QueryParam("collection") @DefaultValue("") String collection) {
+
         String queryId = UUID.randomUUID().toString();
         int shardK = perShardK > 0 ? perShardK : k;
-        LOG.infof("Leader: Starting Search %s (K=%d, collab=%b)", queryId, k, collaborative);
+        LOG.infof("Leader: Starting Search %s (K=%d, collab=%b, collection=%s)", queryId, k, collaborative, collection);
 
-        SearchRequest request = SearchRequest.newBuilder()
+        SearchRequest.Builder reqBuilder = SearchRequest.newBuilder()
                 .setQueryId(queryId)
                 .addAllVector(vector)
                 .setK(shardK)
-                .setCollaborative(collaborative)
-                .build();
+                .setCollaborative(collaborative);
+        if (collection != null && !collection.isEmpty()) {
+            reqBuilder.setCollection(collection);
+        }
+        SearchRequest request = reqBuilder.build();
 
         // RELAY ARCHITECTURE: No leader-side heap during search - avoid synchronized bottleneck.
         // Track best scores for floor broadcast; build Top-K only at end from collected hits.
@@ -161,10 +168,11 @@ public class KnnResource {
 
         // 1. Local shard
         allStreams.add(localService.search(request)
-                .onItem().invoke(hit -> {
-                    if (hit.getGlobalId() < Long.MAX_VALUE - 100 && hit.getGlobalId() != 0) {
-                        synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(hit.getGlobalId(), hit.getScore(), hit.getChunk())); }
-                        if (collaborative) relayCoordination(queryId, hit.getScore(), globalBestAcc, coordinatorBroadcaster);
+                .onItem().invoke(msg -> {
+                    if (msg.getPayloadCase() == SearchResponse.PayloadCase.HIT) {
+                        SearchHit h = msg.getHit();
+                        synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(h.getGlobalId(), h.getScore(), h.getChunk())); }
+                        if (collaborative) relayCoordination(queryId, h.getScore(), globalBestAcc, coordinatorBroadcaster);
                     }
                 }));
 
@@ -215,10 +223,11 @@ public class KnnResource {
                 }, err -> {});
 
         return peer.search(request)
-                .onItem().invoke(hit -> {
-                    if (hit.getGlobalId() < Long.MAX_VALUE - 100 && hit.getGlobalId() != 0) {
-                        synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(hit.getGlobalId(), hit.getScore(), hit.getChunk())); }
-                        if (bestAcc != null) relayCoordination(request.getQueryId(), hit.getScore(), bestAcc, broadcaster);
+                .onItem().invoke(msg -> {
+                    if (msg.getPayloadCase() == SearchResponse.PayloadCase.HIT) {
+                        SearchHit h = msg.getHit();
+                        synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(h.getGlobalId(), h.getScore(), h.getChunk())); }
+                        if (bestAcc != null) relayCoordination(request.getQueryId(), h.getScore(), bestAcc, broadcaster);
                     }
                 });
     }
@@ -231,9 +240,9 @@ public class KnnResource {
         AtomicInteger finishedShards = new AtomicInteger(0);
 
         return Multi.createBy().merging().streams(streams)
-                .onItem().invoke(hit -> {
-                    if (hit.getGlobalId() > Long.MAX_VALUE - 100) {
-                        totalVisited.addAndGet(hit.getNodesVisited());
+                .onItem().invoke(msg -> {
+                    if (msg.getPayloadCase() == SearchResponse.PayloadCase.DEBUG) {
+                        totalVisited.addAndGet(msg.getDebug().getNodesVisited());
                         finishedShards.incrementAndGet();
                     }
                 })

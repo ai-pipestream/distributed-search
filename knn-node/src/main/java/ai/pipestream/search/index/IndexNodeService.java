@@ -1,10 +1,15 @@
 package ai.pipestream.search.index;
 
 import ai.pipestream.index.v1.*;
+import ai.pipestream.search.discovery.ScaleCubeClusterBootstrap;
+import ai.pipestream.search.discovery.ShardMetadata;
+import ai.pipestream.search.grpc.GrpcChannelCache;
 import ai.pipestream.search.node.DjlService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.grpc.GrpcService;
+import io.scalecube.cluster.Cluster;
+import io.scalecube.cluster.Member;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import io.smallrye.mutiny.infrastructure.Infrastructure;
@@ -18,6 +23,7 @@ import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
 
 import java.util.List;
+import java.util.Optional;
 
 /**
  * gRPC IndexService implementation — handles document indexing, deletion, and collection CRUD.
@@ -36,6 +42,15 @@ public class IndexNodeService implements IndexService {
     LuceneDocumentConverter converter;
 
     @Inject
+    ShardRouter router;
+
+    @Inject
+    ScaleCubeClusterBootstrap clusterBootstrap;
+
+    @Inject
+    GrpcChannelCache channelCache;
+
+    @Inject
     @RestClient
     DjlService djlService;
 
@@ -46,36 +61,30 @@ public class IndexNodeService implements IndexService {
 
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
-        return Uni.createFrom().item(() -> {
-            try {
-                return indexSingle(request);
-            } catch (Exception e) {
-                LOG.debugf(e, "Failed to index doc %s: %s", request.getDocId(), e.getMessage());
-                return IndexDocumentResponse.newBuilder()
-                        .setSuccess(false)
-                        .setDocId(request.getDocId())
-                        .setError(e.getMessage())
-                        .build();
-            }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        return router.routeAndIndex(request, this::indexSingleSafe)
+                .onFailure().recoverWithItem(e -> {
+                    LOG.debugf(e, "Failed to index doc %s: %s", request.getDocId(), e.getMessage());
+                    return IndexDocumentResponse.newBuilder()
+                            .setSuccess(false)
+                            .setDocId(request.getDocId())
+                            .setError(e.getMessage())
+                            .build();
+                });
     }
 
     @Override
     public Multi<IndexDocumentResponse> streamIndex(Multi<IndexDocumentRequest> requests) {
         return requests
                 .onItem().transformToUniAndMerge(request ->
-                        Uni.createFrom().item(() -> {
-                            try {
-                                return indexSingle(request);
-                            } catch (Exception e) {
-                                LOG.debugf(e, "Stream index failed for doc %s: %s", request.getDocId(), e.getMessage());
-                                return IndexDocumentResponse.newBuilder()
-                                        .setSuccess(false)
-                                        .setDocId(request.getDocId())
-                                        .setError(e.getMessage())
-                                        .build();
-                            }
-                        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
+                        router.routeAndIndex(request, this::indexSingleSafe)
+                                .onFailure().recoverWithItem(e -> {
+                                    LOG.debugf(e, "Stream index failed for doc %s: %s", request.getDocId(), e.getMessage());
+                                    return IndexDocumentResponse.newBuilder()
+                                            .setSuccess(false)
+                                            .setDocId(request.getDocId())
+                                            .setError(e.getMessage())
+                                            .build();
+                                })
                 );
     }
 
@@ -120,6 +129,9 @@ public class IndexNodeService implements IndexService {
                         request.getEmbeddingModel()
                 );
 
+                // Broadcast to cluster peers (fire-and-forget)
+                broadcastCreateCollection(request);
+
                 return CreateCollectionResponse.newBuilder()
                         .setCollection(toCollectionInfo(config))
                         .build();
@@ -159,6 +171,10 @@ public class IndexNodeService implements IndexService {
         return Uni.createFrom().item(() -> {
             try {
                 boolean deleted = collections.deleteCollection(request.getName());
+
+                // Broadcast to cluster peers (fire-and-forget)
+                broadcastDeleteCollection(request);
+
                 return DeleteCollectionResponse.newBuilder().setSuccess(deleted).build();
             } catch (Exception e) {
                 LOG.errorf(e, "Failed to delete collection %s", request.getName());
@@ -168,6 +184,75 @@ public class IndexNodeService implements IndexService {
     }
 
     // --- Private helpers ---
+
+    /**
+     * Safe wrapper for indexSingle that catches exceptions and returns error responses.
+     * Used as a functional reference for ShardRouter.
+     */
+    IndexDocumentResponse indexSingleSafe(IndexDocumentRequest request) {
+        try {
+            return indexSingle(request);
+        } catch (Exception e) {
+            LOG.debugf(e, "indexSingle failed for doc %s: %s", request.getDocId(), e.getMessage());
+            return IndexDocumentResponse.newBuilder()
+                    .setSuccess(false)
+                    .setDocId(request.getDocId())
+                    .setError(e.getMessage())
+                    .build();
+        }
+    }
+
+    private void broadcastCreateCollection(CreateCollectionRequest request) {
+        if (!clusterBootstrap.isEnabled()) return;
+
+        Cluster cluster = clusterBootstrap.getCluster();
+        for (Member member : cluster.members()) {
+            if (cluster.member().id().equals(member.id())) continue;
+
+            Optional<ShardMetadata> metaOpt = cluster.metadata(member);
+            if (metaOpt.isPresent()) {
+                ShardMetadata meta = metaOpt.get();
+                String host = parseHost(member.address());
+                int port = meta.grpcPort() > 0 ? meta.grpcPort() : parsePort(member.address());
+                try {
+                    MutinyIndexServiceGrpc.newMutinyStub(channelCache.getOrCreate(host, port))
+                            .createCollection(request)
+                            .subscribe().with(
+                                    resp -> LOG.debugf("Broadcast createCollection '%s' to %s:%d succeeded", request.getName(), host, port),
+                                    err -> LOG.warnf("Broadcast createCollection '%s' to %s:%d failed: %s", request.getName(), host, port, err.getMessage())
+                            );
+                } catch (Exception e) {
+                    LOG.warnf("Failed to broadcast createCollection to %s:%d: %s", host, port, e.getMessage());
+                }
+            }
+        }
+    }
+
+    private void broadcastDeleteCollection(DeleteCollectionRequest request) {
+        if (!clusterBootstrap.isEnabled()) return;
+
+        Cluster cluster = clusterBootstrap.getCluster();
+        for (Member member : cluster.members()) {
+            if (cluster.member().id().equals(member.id())) continue;
+
+            Optional<ShardMetadata> metaOpt = cluster.metadata(member);
+            if (metaOpt.isPresent()) {
+                ShardMetadata meta = metaOpt.get();
+                String host = parseHost(member.address());
+                int port = meta.grpcPort() > 0 ? meta.grpcPort() : parsePort(member.address());
+                try {
+                    MutinyIndexServiceGrpc.newMutinyStub(channelCache.getOrCreate(host, port))
+                            .deleteCollection(request)
+                            .subscribe().with(
+                                    resp -> LOG.debugf("Broadcast deleteCollection '%s' to %s:%d succeeded", request.getName(), host, port),
+                                    err -> LOG.warnf("Broadcast deleteCollection '%s' to %s:%d failed: %s", request.getName(), host, port, err.getMessage())
+                            );
+                } catch (Exception e) {
+                    LOG.warnf("Failed to broadcast deleteCollection to %s:%d: %s", host, port, e.getMessage());
+                }
+            }
+        }
+    }
 
     private IndexDocumentResponse indexSingle(IndexDocumentRequest request) throws Exception {
         CollectionConfig config = collections.getConfig(request.getCollection());
@@ -258,5 +343,19 @@ public class IndexNodeService implements IndexService {
             case EUCLIDEAN -> VectorSimilarity.VECTOR_SIMILARITY_EUCLIDEAN;
             default -> VectorSimilarity.VECTOR_SIMILARITY_COSINE;
         };
+    }
+
+    private static String parseHost(String address) {
+        if (address == null || !address.contains(":")) return "localhost";
+        return address.substring(0, address.indexOf(':'));
+    }
+
+    private static int parsePort(String address) {
+        if (address == null || !address.contains(":")) return 0;
+        try {
+            return Integer.parseInt(address.substring(address.indexOf(':') + 1));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 }

@@ -81,8 +81,17 @@ public class CollectionManager {
     public CollectionConfig createCollection(String name, int vectorDimension,
                                              VectorSimilarityFunction similarity,
                                              int numShards, String embeddingModel) throws IOException {
-        if (configs.containsKey(name)) {
-            throw new IllegalArgumentException("Collection already exists: " + name);
+        CollectionConfig existing = configs.get(name);
+        if (existing != null) {
+            // Idempotent: same config → return existing; different config → error
+            if (existing.vectorDimension() == vectorDimension && existing.numShards() == numShards) {
+                LOG.infof("Collection '%s' already exists with matching config — returning existing", name);
+                return existing;
+            }
+            throw new IllegalArgumentException(
+                    "Collection already exists with different config: " + name
+                            + " (existing dim=" + existing.vectorDimension() + "/shards=" + existing.numShards()
+                            + ", requested dim=" + vectorDimension + "/shards=" + numShards + ")");
         }
 
         CollectionConfig config = new CollectionConfig(name, vectorDimension, similarity, numShards, embeddingModel);

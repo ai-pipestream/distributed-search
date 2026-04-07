@@ -1,6 +1,10 @@
 package ai.pipestream.search.index;
 
 import ai.pipestream.index.v1.*;
+import ai.pipestream.search.grpc.KnnNodeService;
+import ai.pipestream.search.grpc.SearchRequest;
+import ai.pipestream.search.grpc.SearchResponse;
+import ai.pipestream.search.grpc.SearchHit;
 import io.quarkus.grpc.GrpcClient;
 import io.quarkus.test.common.QuarkusTestResource;
 import io.quarkus.test.common.QuarkusTestResourceLifecycleManager;
@@ -35,6 +39,9 @@ public class IndexServiceTest {
 
     @GrpcClient
     IndexService indexService;
+
+    @GrpcClient
+    KnnNodeService knnService;
 
     @Inject
     CollectionManager collectionManager;
@@ -324,6 +331,111 @@ public class IndexServiceTest {
                 "Expected at least 100 docs, got " + response.getCollection().getTotalDocs());
     }
 
+    // --- Index → Search E2E ---
+
+    @Test
+    @Order(50)
+    void testIndexThenSearchViaCollection() {
+        String e2eCollection = "e2e-search-test";
+        int e2eDim = 32;
+
+        // 1. Create a 1-shard collection for single-node search
+        CreateCollectionResponse createResp = indexService.createCollection(
+                CreateCollectionRequest.newBuilder()
+                        .setName(e2eCollection)
+                        .setVectorDimension(e2eDim)
+                        .setSimilarity(VectorSimilarity.VECTOR_SIMILARITY_COSINE)
+                        .setNumShards(1)
+                        .build()
+        ).await().atMost(Duration.ofSeconds(10));
+        assertNotNull(createResp.getCollection());
+
+        // 2. Create a known "target" vector and 9 random docs
+        float[] targetVector = new float[e2eDim];
+        // Target: all positive values in first half, zeros elsewhere
+        for (int i = 0; i < e2eDim / 2; i++) {
+            targetVector[i] = 1.0f;
+        }
+        normalize(targetVector);
+
+        IndexDocumentResponse targetResp = indexService.indexDocument(
+                IndexDocumentRequest.newBuilder()
+                        .setCollection(e2eCollection)
+                        .setDocId("target-doc")
+                        .setVector(VectorContent.newBuilder().addAllValues(toFloatList(targetVector)).build())
+                        .setChunkText("This is the target document we are looking for.")
+                        .build()
+        ).await().atMost(Duration.ofSeconds(10));
+        assertTrue(targetResp.getSuccess(), "Target doc should index successfully");
+
+        Random rng = new Random(999);
+        for (int i = 0; i < 9; i++) {
+            float[] randVec = randomNormalizedVector(e2eDim, rng);
+            indexService.indexDocument(
+                    IndexDocumentRequest.newBuilder()
+                            .setCollection(e2eCollection)
+                            .setDocId("noise-doc-" + i)
+                            .setVector(VectorContent.newBuilder().addAllValues(toFloatList(randVec)).build())
+                            .setChunkText("Random noise document " + i)
+                            .build()
+            ).await().atMost(Duration.ofSeconds(10));
+        }
+
+        // 3. Commit and verify doc count so the NRT reader can see the docs
+        collectionManager.periodicCommit();
+
+        // Force merge + commit to ensure HNSW graph is fully built
+        try {
+            var writer = collectionManager.getWriter(e2eCollection, 0);
+            writer.forceMerge(1);
+            writer.commit();
+        } catch (Exception e) {
+            fail("Failed to merge/commit: " + e.getMessage());
+        }
+
+        long docCount = collectionManager.getDocCount(e2eCollection, 0);
+        assertTrue(docCount >= 10, "Expected at least 10 docs in shard 0 of E2E collection, got " + docCount);
+
+        // 4. Search for the target vector within the collection
+        List<Float> queryVector = toFloatList(targetVector);
+
+        AssertSubscriber<SearchResponse> subscriber = knnService.search(
+                SearchRequest.newBuilder()
+                        .setQueryId("e2e-test-query")
+                        .addAllVector(queryVector)
+                        .setK(20)
+                        .setCollaborative(false)
+                        .setCollection(e2eCollection)
+                        .build()
+        ).subscribe().withSubscriber(AssertSubscriber.create(100));
+
+        subscriber.awaitCompletion(Duration.ofSeconds(15));
+        List<SearchResponse> responses = subscriber.getItems();
+
+        // Only hit payloads (exclude debug/terminal)
+        List<SearchHit> realHits = responses.stream()
+                .filter(r -> r.getPayloadCase() == SearchResponse.PayloadCase.HIT)
+                .map(SearchResponse::getHit)
+                .filter(h -> h.getScore() > 0)
+                .toList();
+
+        assertFalse(realHits.isEmpty(), "Should have at least one real hit");
+
+        // The top hit (by score) should be the target doc (identical query vector → score ~1.0)
+        SearchHit topHit = realHits.stream()
+                .max((a, b) -> Float.compare(a.getScore(), b.getScore()))
+                .orElseThrow();
+        assertTrue(topHit.getChunk().contains("target document"),
+                "Top hit should be the target doc, got chunk: " + topHit.getChunk()
+                        + " (score=" + topHit.getScore() + ")");
+
+        // 5. Cleanup: delete the E2E collection
+        DeleteCollectionResponse delResp = indexService.deleteCollection(
+                DeleteCollectionRequest.newBuilder().setName(e2eCollection).build()
+        ).await().atMost(Duration.ofSeconds(10));
+        assertTrue(delResp.getSuccess());
+    }
+
     // --- Delete Collection ---
 
     @Test
@@ -354,6 +466,13 @@ public class IndexServiceTest {
     }
 
     // --- Helpers ---
+
+    private static void normalize(float[] vec) {
+        float norm = 0;
+        for (float v : vec) norm += v * v;
+        norm = (float) Math.sqrt(norm);
+        for (int i = 0; i < vec.length; i++) vec[i] /= norm;
+    }
 
     private static float[] randomNormalizedVector(int dim, int seed) {
         return randomNormalizedVector(dim, new Random(seed));

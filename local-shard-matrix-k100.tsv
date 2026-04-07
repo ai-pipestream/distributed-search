@@ -1,0 +1,165 @@
+=== shards=1 mode=independent ===
+Shards: /work/opensearch-grpc-knn/distributed-search/shards-1-new (1 shards)
+Search threads: 1
+Query threads: 1
+Queries: /work/opensearch-grpc-knn/data/sentences-1024d-queries.vec dim=1024
+Max queries: 1000
+Docs (for recall): /work/opensearch-grpc-knn/data/sentences-1024d-docs.vec
+K values: [100]
+
+nDoc=72969 numShards=1 num_queries=1000
+
+topK	latency_ms	avg_shard_ms	stddev_ms	merged_recall	lookups_saved	nDoc	numShards	num_queries
+100	1	1.1	0.0	0.9749	69200	72969	1	1000
+
+SUMMARY	shards-1-new	100	1	1.1	0.0	0.9749	69200	72969	1	1000
+
+=== shards=1 mode=collaborative ===
+Shards: /work/opensearch-grpc-knn/distributed-search/shards-1-new (1 shards)
+Search threads: 1
+Query threads: 1
+Queries: /work/opensearch-grpc-knn/data/sentences-1024d-queries.vec dim=1024
+Max queries: 1000
+Docs (for recall): /work/opensearch-grpc-knn/data/sentences-1024d-docs.vec
+K values: [100]
+Collaborative HNSW: enabled (PR 15676; shared min-score across shards)
+
+nDoc=72969 numShards=1 num_queries=1000
+
+topK	latency_ms	avg_shard_ms	stddev_ms	merged_recall	lookups_saved	nDoc	numShards	num_queries
+100	0	0.8	0.0	0.9479	70272	72969	1	1000
+
+SUMMARY	shards-1-new	100	0	0.8	0.0	0.9479	70272	72969	1	1000
+
+=== shards=2 mode=independent ===
+Shards: /work/opensearch-grpc-knn/distributed-search/shards-2-new (2 shards)
+Search threads: 2
+Query threads: 1
+Queries: /work/opensearch-grpc-knn/data/sentences-1024d-queries.vec dim=1024
+Max queries: 1000
+Docs (for recall): /work/opensearch-grpc-knn/data/sentences-1024d-docs.vec
+K values: [100]
+
+nDoc=72969 numShards=2 num_queries=1000
+
+topK	latency_ms	avg_shard_ms	stddev_ms	merged_recall	lookups_saved	nDoc	numShards	num_queries
+100	0	0.4	0.1	0.7395	69364	72969	2	1000
+
+SUMMARY	shards-2-new	100	0	0.4	0.1	0.7395	69364	72969	2	1000
+
+=== shards=2 mode=collaborative ===
+Shards: /work/opensearch-grpc-knn/distributed-search/shards-2-new (2 shards)
+Search threads: 2
+Query threads: 1
+Queries: /work/opensearch-grpc-knn/data/sentences-1024d-queries.vec dim=1024
+Max queries: 1000
+Docs (for recall): /work/opensearch-grpc-knn/data/sentences-1024d-docs.vec
+K values: [100]
+Collaborative HNSW: enabled (PR 15676; shared min-score across shards)
+
+nDoc=72969 numShards=2 num_queries=1000
+
+topK	latency_ms	avg_shard_ms	stddev_ms	merged_recall	lookups_saved	nDoc	numShards	num_queries
+100	0	0.5	0.1	0.7392	69639	72969	2	1000
+
+SUMMARY	shards-2-new	100	0	0.5	0.1	0.7392	69639	72969	2	1000
+
+=== shards=4 mode=independent ===
+Shards: /work/opensearch-grpc-knn/distributed-search/shards-4-new (4 shards)
+Search threads: 4
+Query threads: 1
+Queries: /work/opensearch-grpc-knn/data/sentences-1024d-queries.vec dim=1024
+Max queries: 1000
+Docs (for recall): /work/opensearch-grpc-knn/data/sentences-1024d-docs.vec
+K values: [100]
+
+nDoc=72969 numShards=4 num_queries=1000
+
+topK	latency_ms	avg_shard_ms	stddev_ms	merged_recall	lookups_saved	nDoc	numShards	num_queries
+100	1	0.7	0.2	0.4931	66270	72969	4	1000
+
+SUMMARY	shards-4-new	100	1	0.7	0.2	0.4931	66270	72969	4	1000
+
+=== shards=4 mode=collaborative ===
+Shards: /work/opensearch-grpc-knn/distributed-search/shards-4-new (4 shards)
+Search threads: 4
+Query threads: 1
+Queries: /work/opensearch-grpc-knn/data/sentences-1024d-queries.vec dim=1024
+Max queries: 1000
+Docs (for recall): /work/opensearch-grpc-knn/data/sentences-1024d-docs.vec
+K values: [100]
+Collaborative HNSW: enabled (PR 15676; shared min-score across shards)
+
+nDoc=72969 numShards=4 num_queries=1000
+
+topK	latency_ms	avg_shard_ms	stddev_ms	merged_recall	lookups_saved	nDoc	numShards	num_queries
+100	1	0.8	0.2	0.4929	66851	72969	4	1000
+
+SUMMARY	shards-4-new	100	1	0.8	0.2	0.4929	66851	72969	4	1000
+
+=== shards=8 mode=independent ===
+Shards: /work/opensearch-grpc-knn/distributed-search/shards-8-new (8 shards)
+Search threads: 8
+Query threads: 1
+Queries: /work/opensearch-grpc-knn/data/sentences-1024d-queries.vec dim=1024
+Max queries: 1000
+Docs (for recall): /work/opensearch-grpc-knn/data/sentences-1024d-docs.vec
+K values: [100]
+
+nDoc=1551284 numShards=8 num_queries=1000
+
+topK	latency_ms	avg_shard_ms	stddev_ms	merged_recall	lookups_saved	nDoc	numShards	num_queries
+100	6	5.8	1.0	0.2905	1491084	1551284	8	1000
+
+SUMMARY	shards-8-new	100	6	5.8	1.0	0.2905	1491084	1551284	8	1000
+
+=== shards=8 mode=collaborative ===
+Shards: /work/opensearch-grpc-knn/distributed-search/shards-8-new (8 shards)
+Search threads: 8
+Query threads: 1
+Queries: /work/opensearch-grpc-knn/data/sentences-1024d-queries.vec dim=1024
+Max queries: 1000
+Docs (for recall): /work/opensearch-grpc-knn/data/sentences-1024d-docs.vec
+K values: [100]
+Collaborative HNSW: enabled (PR 15676; shared min-score across shards)
+
+nDoc=1551284 numShards=8 num_queries=1000
+
+topK	latency_ms	avg_shard_ms	stddev_ms	merged_recall	lookups_saved	nDoc	numShards	num_queries
+100	3	3.2	0.3	0.2904	1518531	1551284	8	1000
+
+SUMMARY	shards-8-new	100	3	3.2	0.3	0.2904	1518531	1551284	8	1000
+
+=== shards=16 mode=independent ===
+Shards: /work/opensearch-grpc-knn/distributed-search/shards-16-new (16 shards)
+Search threads: 16
+Query threads: 1
+Queries: /work/opensearch-grpc-knn/data/sentences-1024d-queries.vec dim=1024
+Max queries: 1000
+Docs (for recall): /work/opensearch-grpc-knn/data/sentences-1024d-docs.vec
+K values: [100]
+
+nDoc=72969 numShards=16 num_queries=1000
+
+topK	latency_ms	avg_shard_ms	stddev_ms	merged_recall	lookups_saved	nDoc	numShards	num_queries
+100	2	1.5	0.3	0.1776	52538	72969	16	1000
+
+SUMMARY	shards-16-new	100	2	1.5	0.3	0.1776	52538	72969	16	1000
+
+=== shards=16 mode=collaborative ===
+Shards: /work/opensearch-grpc-knn/distributed-search/shards-16-new (16 shards)
+Search threads: 16
+Query threads: 1
+Queries: /work/opensearch-grpc-knn/data/sentences-1024d-queries.vec dim=1024
+Max queries: 1000
+Docs (for recall): /work/opensearch-grpc-knn/data/sentences-1024d-docs.vec
+K values: [100]
+Collaborative HNSW: enabled (PR 15676; shared min-score across shards)
+
+nDoc=72969 numShards=16 num_queries=1000
+
+topK	latency_ms	avg_shard_ms	stddev_ms	merged_recall	lookups_saved	nDoc	numShards	num_queries
+100	1	1.4	0.4	0.1776	54521	72969	16	1000
+
+SUMMARY	shards-16-new	100	1	1.4	0.4	0.1776	54521	72969	16	1000
+

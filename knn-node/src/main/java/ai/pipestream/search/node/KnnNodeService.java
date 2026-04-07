@@ -109,14 +109,12 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                     }
 
                     if (emittedCount < originalK) {
-                        SearchResponse.Builder hitBuilder = SearchResponse.newBuilder()
+                        ai.pipestream.search.grpc.SearchHit.Builder hitBuilder = ai.pipestream.search.grpc.SearchHit.newBuilder()
                                 .setGlobalId(((long) shardId << 32) | docId)
                                 .setScore(similarity);
-                        
                         String chunk = getChunk(storedFields, docId);
                         if (chunk != null) hitBuilder.setChunk(chunk);
-                        
-                        emitter.emit(hitBuilder.build());
+                        emitter.emit(SearchResponse.newBuilder().setHit(hitBuilder.build()).build());
                         emittedCount++;
                     }
                 } catch (Exception e) {
@@ -212,9 +210,10 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                     shardId, qid, td.scoreDocs.length, visits.get());
 
                 emitter.emit(SearchResponse.newBuilder()
-                        .setGlobalId(Long.MAX_VALUE - shardId)
-                        .setNodesVisited(visits.get())
-                        .setSearchTimeMs(System.currentTimeMillis() - startTime)
+                        .setDebug(SearchDebug.newBuilder()
+                                .setNodesVisited(visits.get())
+                                .setSearchTimeMs(System.currentTimeMillis() - startTime)
+                                .build())
                         .build());
                 
                 emitter.complete();
