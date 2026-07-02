@@ -26,6 +26,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.Random;
 import java.util.UUID;
@@ -157,10 +158,18 @@ public class KnnResource {
         }
         SearchRequest request = reqBuilder.build();
 
-        // RELAY ARCHITECTURE: No leader-side heap during search - avoid synchronized bottleneck.
-        // Track best scores for floor broadcast; build Top-K only at end from collected hits.
+        // RELAY ARCHITECTURE: Track the global kth-best for floor broadcast; build
+        // Top-K only at end from collected hits. The floor accumulator holds the
+        // kth-best score seen so far — CollaborativeKnnCollector treats it as the
+        // global kth-best in earlyTerminated() (a shard gives up only when its best
+        // hit cannot make the global top-k), so broadcasting the BEST score would
+        // over-prune. floorHeap is a bounded min-heap of the k best hit scores; its
+        // min is the floor and only exists once k hits have been received. It is a
+        // per-query local captured by the stream handlers, so it is GC'd with the
+        // query — no cross-query state.
         LongAccumulator globalBestAcc = collaborative
                 ? new LongAccumulator(Long::max, Long.MIN_VALUE) : null;
+        PriorityQueue<Float> floorHeap = collaborative ? new PriorityQueue<>(k) : null;
         BroadcastProcessor<CoordinateRequest> coordinatorBroadcaster = BroadcastProcessor.create();
         List<KnnNodeService.SearchHit> resultHits = new ArrayList<>();
 
@@ -172,7 +181,7 @@ public class KnnResource {
                     if (msg.getPayloadCase() == SearchResponse.PayloadCase.HIT) {
                         SearchHit h = msg.getHit();
                         synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(h.getGlobalId(), h.getScore(), h.getChunk())); }
-                        if (collaborative) relayCoordination(queryId, h.getScore(), globalBestAcc, coordinatorBroadcaster);
+                        if (collaborative) relayHitScore(queryId, h.getScore(), k, floorHeap, globalBestAcc, coordinatorBroadcaster);
                     }
                 }));
 
@@ -182,7 +191,7 @@ public class KnnResource {
                     .onItem().transformToUni(instances -> {
                         List<ServiceInstance> selectedPeers = selectPeers(instances, maxPeers);
                         for (ServiceInstance si : selectedPeers) {
-                            allStreams.add(callPeerStreaming(si.getHost(), si.getPort(), request, resultHits, globalBestAcc, coordinatorBroadcaster));
+                            allStreams.add(callPeerStreaming(si.getHost(), si.getPort(), request, resultHits, k, floorHeap, globalBestAcc, coordinatorBroadcaster));
                         }
                         return aggregateFirehoses(allStreams, resultHits, k, queryId, globalBestAcc != null);
                     });
@@ -191,10 +200,37 @@ public class KnnResource {
         return aggregateFirehoses(allStreams, resultHits, k, queryId, globalBestAcc != null);
     }
 
-    /** Relay: when a better score is seen, broadcast to all shards. No heap - lightweight. */
+    /**
+     * Track a received hit score and relay the global kth-best floor. Before k hits
+     * exist there is no valid kth-best, so nothing is broadcast. Once the heap is
+     * full, its min is the kth-best; it only rises, and relayCoordination's
+     * monotonic guard dedups broadcasts.
+     */
+    private void relayHitScore(String qid, float score, int k,
+                               PriorityQueue<Float> floorHeap,
+                               LongAccumulator bestAcc,
+                               BroadcastProcessor<CoordinateRequest> broadcaster) {
+        if (bestAcc == null || floorHeap == null) return;
+        float floor;
+        synchronized (floorHeap) {
+            if (floorHeap.size() < k) {
+                floorHeap.offer(score);
+                if (floorHeap.size() < k) return; // no kth-best floor until k hits seen
+            } else if (score > floorHeap.peek()) {
+                floorHeap.poll();
+                floorHeap.offer(score);
+            } else {
+                return; // kth-best unchanged
+            }
+            floor = floorHeap.peek();
+        }
+        relayCoordination(qid, floor, bestAcc, broadcaster);
+    }
+
+    /** Relay: when the floor rises, broadcast to all shards. Monotonic - lightweight. */
     private void relayCoordination(String qid, float score, LongAccumulator bestAcc,
                                   BroadcastProcessor<CoordinateRequest> broadcaster) {
-        if (bestAcc == null) return;
+        if (bestAcc == null || !Float.isFinite(score)) return;
         long encoded = CollaborativeKnnCollector.encode(Integer.MAX_VALUE, score);
         long old = bestAcc.get();
         bestAcc.accumulate(encoded);
@@ -209,6 +245,8 @@ public class KnnResource {
     private Multi<SearchResponse> callPeerStreaming(
             String host, int port, SearchRequest request,
             List<KnnNodeService.SearchHit> resultHits,
+            int k,
+            PriorityQueue<Float> floorHeap,
             LongAccumulator bestAcc,
             BroadcastProcessor<CoordinateRequest> broadcaster) {
 
@@ -219,6 +257,8 @@ public class KnnResource {
 
         peer.coordinate(outboundCoordination)
                 .subscribe().with(resp -> {
+                    // Shard-reported floors are already local kth-bests: max-accumulating
+                    // them through the same monotonic broadcast guard is valid as-is.
                     if (bestAcc != null) relayCoordination(request.getQueryId(), resp.getMinScore(), bestAcc, broadcaster);
                 }, err -> {});
 
@@ -227,7 +267,7 @@ public class KnnResource {
                     if (msg.getPayloadCase() == SearchResponse.PayloadCase.HIT) {
                         SearchHit h = msg.getHit();
                         synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(h.getGlobalId(), h.getScore(), h.getChunk())); }
-                        if (bestAcc != null) relayCoordination(request.getQueryId(), h.getScore(), bestAcc, broadcaster);
+                        if (bestAcc != null) relayHitScore(request.getQueryId(), h.getScore(), k, floorHeap, bestAcc, broadcaster);
                     }
                 });
     }

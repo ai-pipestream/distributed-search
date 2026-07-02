@@ -36,6 +36,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -105,6 +106,8 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
         private final String vectorField;
         private final String idField;       // null → synthesize (shardId << 32) | docId
         private final boolean sketchEnabled;
+        private final int docBase;          // collect() receives leaf-local doc ids
+        private final Set<Integer> emittedDocs; // query-scoped, reader-global doc ids
         private int emittedCount = 0;
 
         public StreamingKnnCollector(KnnCollector delegate,
@@ -117,7 +120,9 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                                    int originalK,
                                    String vectorField,
                                    String idField,
-                                   boolean sketchEnabled) {
+                                   boolean sketchEnabled,
+                                   int docBase,
+                                   Set<Integer> emittedDocs) {
             super(delegate);
             this.emitter = emitter;
             this.shardId = shardId;
@@ -129,6 +134,8 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
             this.vectorField = vectorField;
             this.idField = idField;
             this.sketchEnabled = sketchEnabled;
+            this.docBase = docBase;
+            this.emittedDocs = emittedDocs;
         }
 
         @Override
@@ -142,28 +149,16 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
             boolean collected = super.collect(docId, similarity);
             if (collected) {
                 try {
+                    int globalDoc = docBase + docId;
                     if (sketchEnabled) {
-                        float[] vec = getVector(leaves, vectorField, docId);
+                        float[] vec = getVector(leaves, vectorField, globalDoc);
                         if (vec != null) {
                             hintRef.set(TopologySketchUtil.computeBinarySignature(vec));
                         }
                     }
 
-                    if (emittedCount < originalK) {
-                        var doc = storedFields.document(docId);
-                        long globalId = ((long) shardId << 32) | docId;
-                        if (idField != null) {
-                            var stored = doc.getField(idField);
-                            if (stored != null && stored.numericValue() != null) {
-                                globalId = stored.numericValue().longValue();
-                            }
-                        }
-                        ai.pipestream.search.grpc.SearchHit.Builder hitBuilder = ai.pipestream.search.grpc.SearchHit.newBuilder()
-                                .setGlobalId(globalId)
-                                .setScore(similarity);
-                        var chunkField = doc.getField("chunk");
-                        if (chunkField != null) hitBuilder.setChunk(chunkField.stringValue());
-                        emitter.emit(SearchResponse.newBuilder().setHit(hitBuilder.build()).build());
+                    if (emittedCount < originalK && emittedDocs.add(globalDoc)) {
+                        emitHit(emitter, storedFields, shardId, globalDoc, similarity, idField);
                         emittedCount++;
                     }
                 } catch (Exception e) {
@@ -172,6 +167,26 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
             }
             return collected;
         }
+    }
+
+    private static void emitHit(MultiEmitter<? super SearchResponse> emitter,
+                                StoredFields storedFields,
+                                int shardId, int globalDoc, float score,
+                                String idField) throws IOException {
+        var doc = storedFields.document(globalDoc);
+        long globalId = ((long) shardId << 32) | globalDoc;
+        if (idField != null) {
+            var stored = doc.getField(idField);
+            if (stored != null && stored.numericValue() != null) {
+                globalId = stored.numericValue().longValue();
+            }
+        }
+        ai.pipestream.search.grpc.SearchHit.Builder hitBuilder = ai.pipestream.search.grpc.SearchHit.newBuilder()
+                .setGlobalId(globalId)
+                .setScore(score);
+        var chunkField = doc.getField("chunk");
+        if (chunkField != null) hitBuilder.setChunk(chunkField.stringValue());
+        emitter.emit(SearchResponse.newBuilder().setHit(hitBuilder.build()).build());
     }
 
     void onStart(@Observes StartupEvent ev) {
@@ -275,6 +290,11 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 float[] vector = new float[request.getVectorCount()];
                 for (int i = 0; i < request.getVectorCount(); i++) vector[i] = request.getVector(i);
 
+                final String idField = externalIndex ? EXTERNAL_ID_FIELD : null;
+                // Reader-global doc ids already emitted for this query, shared across
+                // leaves and consulted by the drain phase below.
+                final Set<Integer> emittedDocs = ConcurrentHashMap.newKeySet();
+
                 KnnCollectorManager manager;
                 if (request.getCollaborative()) {
                     manager = new CollaborativeKnnCollectorManager(internalK, acc);
@@ -287,7 +307,7 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                     public KnnCollector newCollector(int ignored, KnnSearchStrategy strategy, LeafReaderContext context) throws IOException {
                         return new StreamingKnnCollector(manager.newCollector(visitLimit, strategy, context),
                                                        emitter, shardId, theReader.storedFields(), theReader.leaves(), visits, hint, request.getK(),
-                                                       vectorField, externalIndex ? EXTERNAL_ID_FIELD : null, !pureMode);
+                                                       vectorField, idField, !pureMode, context.docBase, emittedDocs);
                     }
                 };
 
@@ -299,9 +319,23 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 };
 
                 TopDocs td = searcher.search(query, internalK);
-                
-                LOG.infof("[DIAGNOSTIC] Shard %d search %s finished. Lucene reported %d hits, visits=%d", 
-                    shardId, qid, td.scoreDocs.length, visits.get());
+
+                // Drain phase: streaming emits candidates as they are ACCEPTED into the
+                // heap, so late entries into the final top-k may not have been emitted.
+                // Emit whatever of the final top-k is still missing (TopDocs doc ids are
+                // reader-global) so the shard's final top-k always reaches the leader.
+                int drained = 0;
+                StoredFields drainStoredFields = theReader.storedFields();
+                for (int i = 0; i < td.scoreDocs.length && i < request.getK(); i++) {
+                    ScoreDoc sd = td.scoreDocs[i];
+                    if (emittedDocs.add(sd.doc)) {
+                        emitHit(emitter, drainStoredFields, shardId, sd.doc, sd.score, idField);
+                        drained++;
+                    }
+                }
+
+                LOG.infof("[DIAGNOSTIC] Shard %d search %s finished. Lucene reported %d hits, drained %d late hits, visits=%d",
+                    shardId, qid, td.scoreDocs.length, drained, visits.get());
 
                 emitter.emit(SearchResponse.newBuilder()
                         .setDebug(SearchDebug.newBuilder()
