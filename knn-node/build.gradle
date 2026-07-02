@@ -22,7 +22,14 @@ dependencies {
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-smallrye-health'
     implementation 'io.quarkus:quarkus-scheduler'
-    implementation files(project.findProperty('luceneJar') ?: '/work/opensearch-grpc-knn/lucene/lucene/core/build/libs/lucene-core-11.0.0-SNAPSHOT.jar')
+    // Lucene jars: pass -PluceneJarDir=<dir> to compile against a locally-built Lucene
+    // (e.g. -PluceneJarDir=/work/opensearch-grpc-knn/lucene-dc-short-circuit/lucene/core/build/libs).
+    // All jars in the dir are included. -PluceneJar=<file> is still honored for existing workflows.
+    def luceneJar = project.findProperty('luceneJar')
+    def luceneJarDir = project.findProperty('luceneJarDir') ?: '/work/opensearch-grpc-knn/lucene/lucene/core/build/libs'
+    implementation luceneJar != null
+            ? files(luceneJar)
+            : fileTree(dir: luceneJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
     testImplementation 'io.quarkus:quarkus-junit'
     testImplementation 'io.rest-assured:rest-assured'
 }
