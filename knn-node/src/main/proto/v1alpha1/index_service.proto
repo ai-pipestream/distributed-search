@@ -1,0 +1,153 @@
+// ai.pipestream.search v1alpha1 -- public indexing surface.
+//
+// Bulk indexing is a bidirectional stream with per-document acks and
+// credit-based flow control tied to the server's flush/merge pressure.
+// See docs/rfc/SEARCH_API_V1.md for the backpressure protocol.
+
+syntax = "proto3";
+
+package ai.pipestream.search.v1alpha1;
+
+import "google/rpc/status.proto";
+import "v1alpha1/common.proto";
+
+option java_multiple_files = true;
+option java_package = "ai.pipestream.search.v1alpha1";
+option java_outer_classname = "IndexServiceProto";
+
+service IndexService {
+  // Bidirectional bulk indexing.
+  //
+  // Client sends: an optional leading BulkOptions frame, then IndexDocument
+  // frames, with FlushMarker frames wherever durability confirmation is
+  // needed.
+  //
+  // Server sends: a FlowControl frame first (initial credit grant), then a
+  // DocAck per document (possibly out of order across shards), further
+  // FlowControl frames as flush/merge pressure changes, and a FlushAck per
+  // FlushMarker.
+  //
+  // Per-document failures are reported in DocAck.status and do NOT
+  // terminate the stream. Only stream-level faults (unknown collection
+  // with no per-doc override, auth, transport) end the RPC with an error.
+  rpc BulkIndex (stream BulkIndexRequest) returns (stream BulkIndexResponse);
+
+  // Fetches a document's stored fields by id.
+  rpc GetDocument (GetDocumentRequest) returns (GetDocumentResponse);
+
+  // Deletes a document by id.
+  rpc DeleteDocument (DeleteDocumentRequest) returns (DeleteDocumentResponse);
+}
+
+// One client->server frame of a BulkIndex stream.
+message BulkIndexRequest {
+  oneof frame {
+    // Stream-level defaults. If present, must be the first frame.
+    BulkOptions options = 1;
+    IndexDocument document = 2;
+    FlushMarker flush = 3;
+  }
+}
+
+// Stream-level defaults for a BulkIndex session.
+message BulkOptions {
+  // Default target collection for documents that leave `collection` empty.
+  string collection = 1;
+}
+
+// A single document to index. Indexing is upsert-by-id: an existing
+// document with the same doc_id is replaced atomically.
+message IndexDocument {
+  // Client-assigned sequence number, strictly increasing per stream.
+  // Acks and flow control are correlated by this value; it also counts
+  // against the flow-control credit window.
+  uint64 client_seq = 1;
+  // Target collection; empty = BulkOptions.collection.
+  string collection = 2;
+  // Document id; empty = server-assigned (returned in DocAck.doc_id).
+  string doc_id = 3;
+  // Typed field values; names and types must match the collection schema.
+  repeated DocumentField fields = 4;
+}
+
+// Requests a durability checkpoint: the server replies with a FlushAck
+// once every document with client_seq <= this frame's client_seq is
+// durable (committed to the Lucene index).
+message FlushMarker {
+  uint64 client_seq = 1;
+}
+
+// One server->client frame of a BulkIndex stream.
+message BulkIndexResponse {
+  oneof frame {
+    DocAck ack = 1;
+    FlowControl flow_control = 2;
+    FlushAck flush_ack = 3;
+  }
+}
+
+// Per-document acknowledgement. OK status means the document was accepted
+// and routed (visible after the next flush, durable after FlushAck).
+message DocAck {
+  // Echo of IndexDocument.client_seq.
+  uint64 client_seq = 1;
+  // Effective document id (echoed, or server-assigned).
+  string doc_id = 2;
+  // Shard that received the document.
+  int32 shard_id = 3;
+  // OK, or the reason this document was rejected (schema mismatch, wrong
+  // vector dims, unknown collection, ...). Non-OK acks do not end the
+  // stream.
+  google.rpc.Status status = 4;
+}
+
+// Credit-based backpressure signal, tied to flush/merge pressure.
+// The client may have at most `window` un-acked documents in flight; each
+// DocAck returns one credit. A new FlowControl frame replaces the window.
+message FlowControl {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    // Accepting at full rate.
+    STATE_READY = 1;
+    // Flush/merge backlog building; window has been reduced.
+    STATE_THROTTLED = 2;
+    // Stop sending documents until the next FlowControl frame. FlushMarker
+    // frames are still allowed.
+    STATE_PAUSED = 3;
+  }
+  State state = 1;
+  // Max un-acked documents the client may have in flight from now on.
+  // 0 when state is STATE_PAUSED.
+  uint32 window = 2;
+  // Human-readable cause, e.g. "merge backlog on shard 3".
+  string detail = 3;
+}
+
+// Durability confirmation for a FlushMarker.
+message FlushAck {
+  // Every document with client_seq <= through_seq is durable.
+  uint64 through_seq = 1;
+}
+
+message GetDocumentRequest {
+  string collection = 1;
+  string doc_id = 2;
+  // Stored fields to return. Empty = all stored fields.
+  repeated string fields = 3;
+}
+
+message GetDocumentResponse {
+  bool found = 1;
+  string doc_id = 2;
+  repeated DocumentField fields = 3;
+}
+
+message DeleteDocumentRequest {
+  string collection = 1;
+  string doc_id = 2;
+}
+
+message DeleteDocumentResponse {
+  // False when no document with that id existed.
+  bool found = 1;
+}

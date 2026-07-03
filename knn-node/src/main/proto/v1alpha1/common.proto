@@ -1,0 +1,485 @@
+// ai.pipestream.search v1alpha1 -- shared vocabulary.
+//
+// This file holds the composable building blocks used by every v1alpha1
+// service: the typed Query AST, field values, collection schema types,
+// per-query budgets, streaming frames (hit / progress / summary), and
+// pagination cursors.
+//
+// Design rules for this package:
+//   * Messages are small and composable; no request/response monoliths.
+//   * RPC-level failures use google.rpc.Status (gRPC rich error model).
+//     In-band partial failures (per-document, per-shard) carry a
+//     google.rpc.Status field instead of ad-hoc bool/string pairs.
+//   * Breaking changes require a new package version (v1alpha2, v1beta1, ...).
+
+syntax = "proto3";
+
+package ai.pipestream.search.v1alpha1;
+
+import "google/protobuf/timestamp.proto";
+import "google/rpc/status.proto";
+
+option java_multiple_files = true;
+option java_package = "ai.pipestream.search.v1alpha1";
+option java_outer_classname = "CommonProto";
+
+// ---------------------------------------------------------------------------
+// Values
+// ---------------------------------------------------------------------------
+
+// A single typed value: used for term/range query operands, document fields
+// on the write path, and stored fields returned on hits.
+message FieldValue {
+  oneof kind {
+    string string_value = 1;
+    int64 int64_value = 2;
+    double double_value = 3;
+    bool bool_value = 4;
+    google.protobuf.Timestamp timestamp_value = 5;
+    // Dense vector value; only valid for dense_vector schema fields.
+    Vector vector_value = 6;
+  }
+}
+
+// A dense float vector. Wrapped in a message (rather than a bare
+// `repeated float`) so it can participate in oneofs and be made optional.
+message Vector {
+  repeated float values = 1;
+}
+
+// A named document field with one or more typed values.
+// Multi-valued fields repeat `values`; dense vectors carry exactly one
+// vector_value.
+message DocumentField {
+  string name = 1;
+  repeated FieldValue values = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Query AST
+// ---------------------------------------------------------------------------
+
+// The root of the typed query tree. Exactly one variant must be set.
+message Query {
+  oneof kind {
+    BoolQuery bool = 1;
+    TermQuery term = 2;
+    MatchQuery match = 3;
+    PhraseQuery phrase = 4;
+    RangeQuery range = 5;
+    KnnQuery knn = 6;
+    HybridQuery hybrid = 7;
+    MatchAllQuery match_all = 8;
+    // Escape hatch: a Lucene classic query string, parsed server-side.
+    QueryStringQuery query_string = 9;
+  }
+
+  // Multiplies the score contribution of this clause. Default 1.0.
+  optional float boost = 15;
+}
+
+// Boolean composition of sub-queries.
+message BoolQuery {
+  // All must match; contributes to score.
+  repeated Query must = 1;
+  // At least `minimum_should_match` must match; contributes to score.
+  repeated Query should = 2;
+  // None may match; does not contribute to score.
+  repeated Query must_not = 3;
+  // All must match; does NOT contribute to score (cacheable).
+  repeated Query filter = 4;
+  // Number of `should` clauses required to match. Default: 1 if there are
+  // no must/filter clauses, otherwise 0.
+  optional int32 minimum_should_match = 5;
+}
+
+// Exact term match against a keyword / numeric / date / bool field.
+// The value is not analyzed.
+message TermQuery {
+  string field = 1;
+  FieldValue value = 2;
+}
+
+// Whether multiple analyzed terms are OR-ed or AND-ed together.
+enum Operator {
+  OPERATOR_UNSPECIFIED = 0; // Defaults to OPERATOR_OR.
+  OPERATOR_OR = 1;
+  OPERATOR_AND = 2;
+}
+
+// Full-text match: `text` is analyzed with the field's analyzer (or the
+// override below) and the resulting terms are combined with `operator`.
+message MatchQuery {
+  string field = 1;
+  string text = 2;
+  Operator operator = 3;
+  // Analyzer override for the query text; empty = field's search analyzer.
+  string analyzer = 4;
+  // Minimum number of analyzed terms that must match (only with OPERATOR_OR).
+  optional int32 minimum_should_match = 5;
+}
+
+// Analyzed phrase match with optional slop (max positional distance).
+message PhraseQuery {
+  string field = 1;
+  string text = 2;
+  int32 slop = 3;
+  // Analyzer override for the query text; empty = field's search analyzer.
+  string analyzer = 4;
+}
+
+// Range over a numeric or date field. Bounds are typed FieldValues; unset
+// bounds are unbounded. String bounds are valid only for keyword fields.
+message RangeQuery {
+  string field = 1;
+  FieldValue gt = 2;
+  FieldValue gte = 3;
+  FieldValue lt = 4;
+  FieldValue lte = 5;
+}
+
+// Approximate k-nearest-neighbor query over a dense_vector field.
+message KnnQuery {
+  string field = 1;
+  // Query vector; dimensionality must match the field schema.
+  Vector vector = 2;
+  // Number of nearest neighbors this clause contributes.
+  int32 k = 3;
+  // First-class pre-filter: graph traversal only visits documents matching
+  // this query. Unset = no filter.
+  Query filter = 4;
+  // Per-shard candidate pool size (ef_search). 0 = server default.
+  int32 num_candidates = 5;
+  // Enables cross-shard collaborative traversal: shards share kth-best
+  // floors mid-flight so each can prune earlier.
+  bool collaborative = 6;
+  // Max graph nodes this clause may visit, summed across shards.
+  // 0 = inherit the request-level SearchBudget.max_visits.
+  int64 visit_budget = 7;
+}
+
+// Combines several sub-queries and fuses their ranked results.
+message HybridQuery {
+  repeated Query queries = 1;
+  Fusion fusion = 2;
+}
+
+// How hybrid sub-query rankings are fused into one ranking.
+message Fusion {
+  oneof method {
+    RrfFusion rrf = 1;
+    LinearFusion linear = 2;
+  }
+}
+
+// Reciprocal Rank Fusion: score(d) = sum over queries of 1 / (k + rank_q(d)).
+message RrfFusion {
+  // Rank constant. 0 = server default (60).
+  int32 k = 1;
+}
+
+// Weighted linear combination of (min-max normalized) sub-query scores.
+message LinearFusion {
+  // Parallel to HybridQuery.queries; must have the same length.
+  repeated float weights = 1;
+}
+
+// Matches every document with score 1.0.
+message MatchAllQuery {}
+
+// Escape hatch: Lucene classic QueryParser syntax, parsed server-side.
+// No compatibility guarantees beyond what the embedded Lucene version
+// provides; prefer the typed AST wherever possible.
+message QueryStringQuery {
+  string query = 1;
+  // Field used for bare terms. Empty = collection default field.
+  string default_field = 2;
+  Operator default_operator = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Budgets
+// ---------------------------------------------------------------------------
+
+// Per-query execution budgets. Collectors check budgets cooperatively and
+// terminate early, reporting what was achieved in the Summary frame.
+// A zero value means "server-configured default"; there is always an
+// effective budget.
+message SearchBudget {
+  // Wall-clock budget for the whole query, in milliseconds.
+  int64 time_ms = 1;
+  // Max graph-node / document visits, summed across all shards.
+  int64 max_visits = 2;
+  // Result budget: max Hit frames the server may stream. Because hits
+  // stream as found, this bounds the stream size, not the final top-k
+  // (see SearchRequest.size).
+  int32 max_hits = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Experimentation
+// ---------------------------------------------------------------------------
+
+// How a query was assigned to an experiment arm.
+enum AssignmentSource {
+  ASSIGNMENT_SOURCE_UNSPECIFIED = 0;
+  // Deterministic weighted bucket: hash(session_pseudo_id + experiment salt).
+  ASSIGNMENT_SOURCE_HASH_BUCKET = 1;
+  // Forced via ClientContext.experiment_overrides.
+  ASSIGNMENT_SOURCE_OVERRIDE = 2;
+}
+
+// The experiment arm a query was served under. Echo this (with query_id)
+// into client-side analytics events; the engine stores no behavioral data.
+message ExperimentContext {
+  string experiment_name = 1;
+  // Arm (variant) name within the experiment.
+  string arm = 2;
+  AssignmentSource assignment_source = 3;
+}
+
+// Pseudonymous client context for experiment assignment. Must never carry
+// PII: session_pseudo_id is expected to be a random per-session token, not
+// a user id, cookie, or address.
+message ClientContext {
+  // Pseudonymous session token used for deterministic arm assignment.
+  // Empty = no experiment participation (queries serve the default profile).
+  string session_pseudo_id = 1;
+  // Forced assignments for testing/QA: experiment_name -> arm name.
+  map<string, string> experiment_overrides = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming frames
+// ---------------------------------------------------------------------------
+
+// First frame of every search stream: the server-issued query identity,
+// sent before any hit so client-side events (clicks, dwell) can reference
+// the query before it completes.
+message SearchContext {
+  // Server-issued id, unique per Search call. The join key between the
+  // server's serving log and client-side analytics events.
+  string query_id = 1;
+  // Set when an experiment applied to this query.
+  ExperimentContext experiment = 2;
+}
+
+// A single matching document, streamed as soon as it enters the current
+// top-k candidate set. A later Hit may displace an earlier one; the final
+// ranking is authoritative only in the Summary frame (top_doc_ids).
+message Hit {
+  string doc_id = 1;
+  float score = 2;
+  // Shard that produced this hit.
+  int32 shard_id = 3;
+  // Requested stored fields (see SearchRequest.fields).
+  repeated DocumentField fields = 4;
+  // The document's dense vector; only when SearchRequest.include_vectors.
+  Vector vector = 5;
+  // 1-based global position of this hit at emission time. Positions are a
+  // display/analytics hint (what the user saw, in stream order); the final
+  // ranking in Summary.top_doc_ids supersedes them.
+  int32 result_position = 6;
+}
+
+// Periodic execution telemetry. Frequency is server-chosen unless
+// SearchRequest.progress_interval_ms is set. Purely informational:
+// clients may ignore every Progress frame.
+message Progress {
+  // Graph nodes / documents visited so far (all shards).
+  int64 visited = 1;
+  // Effective visit budget for this query (echo of the resolved budget).
+  int64 visit_budget = 2;
+  // Wall-clock time spent so far.
+  int64 elapsed_ms = 3;
+  int32 shards_completed = 4;
+  int32 shards_total = 5;
+  // Current kth-best score floor: the minimum score a new candidate must
+  // beat to enter the top-k set.
+  float kth_best_floor = 6;
+}
+
+// Why a query stopped.
+enum TerminationReason {
+  TERMINATION_REASON_UNSPECIFIED = 0;
+  // Ran to natural completion.
+  TERMINATION_REASON_COMPLETE = 1;
+  TERMINATION_REASON_TIME_BUDGET = 2;
+  TERMINATION_REASON_VISIT_BUDGET = 3;
+  TERMINATION_REASON_HIT_BUDGET = 4;
+}
+
+// Per-shard outcome, reported in the Summary frame. A shard that failed
+// carries a non-OK status; the query still succeeds with partial results
+// unless every shard failed.
+message ShardSummary {
+  int32 shard_id = 1;
+  int64 visited = 2;
+  int64 took_ms = 3;
+  google.rpc.Status status = 4;
+}
+
+// Terminal frame of a search stream: exactly one, always last.
+message Summary {
+  // Final ranked top-k document ids, best first. Clients that buffered Hit
+  // frames by doc_id reconstruct the final result list from this ordering.
+  repeated string top_doc_ids = 1;
+  // Matching documents found. With early termination this is a lower bound
+  // (relation GTE).
+  int64 total_hits = 2;
+  TotalHitsRelation total_hits_relation = 3;
+  // Total graph nodes / documents visited (all shards).
+  int64 visited = 4;
+  // Wall-clock duration of the query.
+  int64 took_ms = 5;
+  // Final kth-best score floor achieved.
+  float kth_best_floor = 6;
+  TerminationReason terminated_by = 7;
+  // Continuation cursor for search_after-style pagination. Unset when the
+  // result set is exhausted. Opaque; pass back verbatim in
+  // SearchRequest.search_after.
+  Cursor next_cursor = 8;
+  repeated ShardSummary shard_summaries = 9;
+  // Echo of SearchContext.query_id, so the terminal frame alone is enough
+  // to correlate with the serving log.
+  string query_id = 10;
+  // Echo of SearchContext.experiment.
+  ExperimentContext experiment = 11;
+}
+
+// Whether total_hits is exact or a lower bound.
+enum TotalHitsRelation {
+  TOTAL_HITS_RELATION_UNSPECIFIED = 0;
+  TOTAL_HITS_RELATION_EQ = 1;
+  TOTAL_HITS_RELATION_GTE = 2;
+}
+
+// Opaque pagination cursor (search_after-style). Encodes the sort position
+// of the last returned hit; minted by the server in Summary.next_cursor.
+// Valid across replicas; not guaranteed valid across schema changes.
+message Cursor {
+  bytes token = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Collection schema types
+// ---------------------------------------------------------------------------
+
+// Similarity function for dense_vector fields.
+enum VectorSimilarity {
+  VECTOR_SIMILARITY_UNSPECIFIED = 0; // Defaults to COSINE.
+  VECTOR_SIMILARITY_COSINE = 1;
+  VECTOR_SIMILARITY_DOT_PRODUCT = 2;
+  VECTOR_SIMILARITY_EUCLIDEAN = 3;
+  VECTOR_SIMILARITY_MAX_INNER_PRODUCT = 4;
+}
+
+// Server-provided analyzers.
+enum BuiltinAnalyzer {
+  BUILTIN_ANALYZER_UNSPECIFIED = 0; // Defaults to STANDARD.
+  BUILTIN_ANALYZER_STANDARD = 1;
+  BUILTIN_ANALYZER_ENGLISH = 2;
+  BUILTIN_ANALYZER_WHITESPACE = 3;
+  BUILTIN_ANALYZER_KEYWORD = 4;
+  BUILTIN_ANALYZER_SIMPLE = 5;
+}
+
+// Reference to an analyzer: a named built-in, or a pluggable analyzer
+// (e.g. an OpenNLP pipeline or a remote gRPC analyzer service).
+message AnalyzerRef {
+  oneof analyzer {
+    BuiltinAnalyzer builtin = 1;
+    PluggableAnalyzer plugin = 2;
+  }
+}
+
+// A pluggable analyzer resolved by the server's analyzer registry.
+message PluggableAnalyzer {
+  // Registered analyzer id, e.g. "opennlp-en" or "grpc-analyzer".
+  string name = 1;
+  // Optional gRPC target for remote analysis services. Empty = in-process.
+  string endpoint = 2;
+  // Analyzer-specific parameters.
+  map<string, string> params = 3;
+}
+
+// Exact-match, unanalyzed string field. Sortable and filterable.
+message KeywordFieldSchema {}
+
+// Analyzed full-text field.
+message TextFieldSchema {
+  // Index-time (and default search-time) analyzer. Unset = STANDARD.
+  AnalyzerRef analyzer = 1;
+}
+
+// Numeric storage width for numeric fields.
+enum NumericType {
+  NUMERIC_TYPE_UNSPECIFIED = 0; // Defaults to INT64.
+  NUMERIC_TYPE_INT32 = 1;
+  NUMERIC_TYPE_INT64 = 2;
+  NUMERIC_TYPE_FLOAT = 3;
+  NUMERIC_TYPE_DOUBLE = 4;
+}
+
+// Numeric point field: range-filterable and sortable.
+message NumericFieldSchema {
+  NumericType type = 1;
+}
+
+// Millisecond-precision date field: range-filterable and sortable.
+message DateFieldSchema {}
+
+// Boolean field.
+message BooleanFieldSchema {}
+
+// HNSW graph construction parameters.
+message HnswParams {
+  // Max connections per graph node. 0 = server default (16).
+  int32 m = 1;
+  // Candidate pool size at index time. 0 = server default (100).
+  int32 ef_construction = 2;
+}
+
+// Vector index construction parameters. Exactly one variant.
+// New index kinds (flat, quantized, IVF) will be added as new variants.
+message VectorIndexParams {
+  oneof params {
+    HnswParams hnsw = 1;
+  }
+}
+
+// Dense float vector field for kNN search.
+message DenseVectorFieldSchema {
+  // Dimensionality; every indexed vector must match exactly.
+  int32 dims = 1;
+  VectorSimilarity similarity = 2;
+  // Unset = HNSW with server defaults.
+  VectorIndexParams index = 3;
+}
+
+// One field in a collection schema.
+message FieldSchema {
+  string name = 1;
+  oneof type {
+    KeywordFieldSchema keyword = 2;
+    TextFieldSchema text = 3;
+    NumericFieldSchema numeric = 4;
+    DateFieldSchema date = 5;
+    BooleanFieldSchema boolean = 6;
+    DenseVectorFieldSchema dense_vector = 7;
+  }
+  // Store the original value for retrieval on hits.
+  bool stored = 15;
+}
+
+// The full field schema of a collection. v1alpha1 schemas are fixed at
+// collection creation (no dynamic mapping, no field mutation).
+message CollectionSchema {
+  repeated FieldSchema fields = 1;
+}
+
+// Replication parameters for a collection.
+message ReplicationParams {
+  // Number of replica copies per shard, excluding the primary. 0 = none.
+  int32 replicas = 1;
+}

@@ -1,0 +1,86 @@
+// ai.pipestream.search v1alpha1 -- public search surface.
+//
+// Search is streaming-first: the server streams Hit frames as candidates
+// are found, interleaves Progress frames, and terminates with exactly one
+// Summary frame. See docs/rfc/SEARCH_API_V1.md for the frame protocol and
+// the guarantees clients may rely on.
+
+syntax = "proto3";
+
+package ai.pipestream.search.v1alpha1;
+
+import "v1alpha1/common.proto";
+
+option java_multiple_files = true;
+option java_package = "ai.pipestream.search.v1alpha1";
+option java_outer_classname = "SearchServiceProto";
+
+service SearchService {
+  // Executes a query and streams frames back:
+  //   * first, exactly one SearchContext frame carrying the server-issued
+  //     query_id (and experiment arm, if any) so client analytics events
+  //     can be logged before the query completes,
+  //   * zero or more Hit frames, emitted as candidates are found
+  //     (unordered; a later Hit may displace an earlier one),
+  //   * zero or more Progress frames (informational, safe to ignore),
+  //   * exactly one terminal Summary frame carrying the final ranking,
+  //     total stats, the kth-best floor achieved, and the continuation
+  //     cursor.
+  // RPC-level failures (bad query, unknown collection, all shards down)
+  // are surfaced as gRPC errors with a google.rpc.Status payload; per-shard
+  // partial failures appear in Summary.shard_summaries.
+  rpc Search (SearchRequest) returns (stream SearchResponse);
+
+  // Explains how (or why not) a single document scores against a query.
+  rpc Explain (ExplainRequest) returns (ExplainResponse);
+}
+
+message SearchRequest {
+  string collection = 1;
+  Query query = 2;
+  // Final top-k size the client wants ranked in the Summary frame.
+  // 0 = server default (10).
+  int32 size = 3;
+  // Execution budgets; unset/zero fields fall back to server defaults.
+  SearchBudget budget = 4;
+  // Continuation cursor from a previous Summary.next_cursor.
+  Cursor search_after = 5;
+  // Stored fields to return on Hit frames. Empty = no stored fields.
+  repeated string fields = 6;
+  // Also return each hit's dense vector (Hit.vector).
+  bool include_vectors = 7;
+  // Desired spacing of Progress frames. 0 = server default cadence.
+  uint32 progress_interval_ms = 8;
+  // Pseudonymous context for experiment assignment (never PII). Unset =
+  // no experiment participation; the collection default profile applies.
+  ClientContext client_context = 9;
+}
+
+// One frame of the search stream. Exactly one variant per message.
+message SearchResponse {
+  oneof frame {
+    Hit hit = 1;
+    Progress progress = 2;
+    Summary summary = 3;
+    // Always the first frame of the stream.
+    SearchContext context = 4;
+  }
+}
+
+message ExplainRequest {
+  string collection = 1;
+  string doc_id = 2;
+  Query query = 3;
+}
+
+message ExplainResponse {
+  bool matched = 1;
+  Explanation explanation = 2;
+}
+
+// Recursive scoring explanation, mirroring Lucene's Explanation tree.
+message Explanation {
+  float value = 1;
+  string description = 2;
+  repeated Explanation details = 3;
+}

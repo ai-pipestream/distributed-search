@@ -1,0 +1,269 @@
+// ai.pipestream.search v1alpha1 -- collection administration.
+//
+// Collections carry a typed field schema (see common.proto), a shard
+// count, and replication parameters. Metadata changes are observable via
+// an etcd-style revisioned watch stream.
+
+syntax = "proto3";
+
+package ai.pipestream.search.v1alpha1;
+
+import "v1alpha1/common.proto";
+
+option java_multiple_files = true;
+option java_package = "ai.pipestream.search.v1alpha1";
+option java_outer_classname = "AdminServiceProto";
+
+service CollectionAdminService {
+  // Creates a collection. Fails with ALREADY_EXISTS if the name is taken,
+  // INVALID_ARGUMENT for schema violations (duplicate field names, missing
+  // dims on dense_vector, ...).
+  rpc CreateCollection (CreateCollectionRequest) returns (CreateCollectionResponse);
+
+  // Drops a collection and deletes its data. Fails with NOT_FOUND if the
+  // collection does not exist.
+  rpc DropCollection (DropCollectionRequest) returns (DropCollectionResponse);
+
+  // Fetches one collection's descriptor. Fails with NOT_FOUND if absent.
+  rpc GetCollection (GetCollectionRequest) returns (GetCollectionResponse);
+
+  // Lists all collections.
+  rpc ListCollections (ListCollectionsRequest) returns (ListCollectionsResponse);
+
+  // Watches collection/topology metadata, etcd-style: an optional initial
+  // snapshot, then one CollectionEvent per metadata revision until the
+  // client cancels. Shard relocation and replica changes surface as PUT
+  // events with an updated descriptor.
+  rpc WatchCollections (WatchCollectionsRequest) returns (stream CollectionEvent);
+
+  // --- Experiments and ranking profiles -----------------------------------
+  // Experiments split traffic across named arms, each pointing at a
+  // RankingProfile. Assignment is stateless and deterministic:
+  //   arm = weighted_pick(hash64(session_pseudo_id + experiment.salt), arms)
+  // so every node computes the same assignment with no coordination
+  // (masterless requirement). The engine stores no behavioral data; see
+  // docs/rfc/SEARCH_API_V1.md "Analytics event contract".
+
+  // Creates or replaces an experiment (upsert by name).
+  rpc PutExperiment (PutExperimentRequest) returns (PutExperimentResponse);
+
+  // Removes an experiment. Traffic reverts to the default profile.
+  rpc DeleteExperiment (DeleteExperimentRequest) returns (DeleteExperimentResponse);
+
+  // Lists experiments (global and per-collection).
+  rpc ListExperiments (ListExperimentsRequest) returns (ListExperimentsResponse);
+
+  // Creates or replaces a ranking profile (upsert by name).
+  rpc PutRankingProfile (PutRankingProfileRequest) returns (PutRankingProfileResponse);
+
+  // Removes a ranking profile. Fails with FAILED_PRECONDITION while any
+  // experiment arm still references it.
+  rpc DeleteRankingProfile (DeleteRankingProfileRequest) returns (DeleteRankingProfileResponse);
+
+  // Lists ranking profiles.
+  rpc ListRankingProfiles (ListRankingProfilesRequest) returns (ListRankingProfilesResponse);
+
+  // Watches experiment and ranking-profile changes, same revision space and
+  // semantics as WatchCollections, so serving nodes and dashboards can
+  // react to experiment rollout without polling.
+  rpc WatchExperiments (WatchExperimentsRequest) returns (stream ExperimentEvent);
+}
+
+// Full descriptor of a collection as of a metadata revision.
+message Collection {
+  string name = 1;
+  CollectionSchema schema = 2;
+  int32 num_shards = 3;
+  ReplicationParams replication = 4;
+  // Metadata revision that produced this descriptor. Monotonically
+  // increasing across the whole cluster; usable as a watch resume point.
+  int64 revision = 5;
+  CollectionStats stats = 6;
+  // Current shard placement.
+  repeated ShardInfo shards = 7;
+}
+
+message CollectionStats {
+  int64 doc_count = 1;
+  int64 size_bytes = 2;
+}
+
+// Placement and size of one shard.
+message ShardInfo {
+  int32 shard_id = 1;
+  // gRPC host/port of the node currently hosting the primary.
+  string host = 2;
+  int32 port = 3;
+  int64 doc_count = 4;
+}
+
+message CreateCollectionRequest {
+  // Lowercase alphanumeric plus hyphens; must be unique.
+  string name = 1;
+  CollectionSchema schema = 2;
+  // 0 = server default (1).
+  int32 num_shards = 3;
+  ReplicationParams replication = 4;
+}
+
+message CreateCollectionResponse {
+  Collection collection = 1;
+}
+
+message DropCollectionRequest {
+  string name = 1;
+}
+
+message DropCollectionResponse {}
+
+message GetCollectionRequest {
+  string name = 1;
+}
+
+message GetCollectionResponse {
+  Collection collection = 1;
+}
+
+message ListCollectionsRequest {}
+
+message ListCollectionsResponse {
+  repeated Collection collections = 1;
+}
+
+message WatchCollectionsRequest {
+  // Watch a single collection by name; empty = watch all collections.
+  string name = 1;
+  // Resume point: replay events with revision > from_revision. 0 = now.
+  // Fails with OUT_OF_RANGE if the revision has been compacted away.
+  int64 from_revision = 2;
+  // Emit a synthetic PUT event per existing collection before live events.
+  bool send_initial_state = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Experiments and ranking profiles
+// ---------------------------------------------------------------------------
+
+// A named bundle of server-side search behavior switches. Experiments point
+// arms at profiles; a profile change re-tunes every arm referencing it.
+// Unset fields mean "no override" (server/collection default applies).
+message RankingProfile {
+  string name = 1;
+  // Fusion override applied to hybrid queries served under this profile.
+  Fusion fusion = 2;
+  // Default budgets for requests that leave SearchBudget fields at zero.
+  SearchBudget default_budget = 3;
+  // Collaborative cross-shard traversal on/off. Presence = override.
+  optional bool collaborative = 4;
+  // Search-time analyzer override for analyzed query nodes.
+  AnalyzerRef analyzer = 5;
+}
+
+// One traffic split arm.
+message ExperimentArm {
+  string name = 1;
+  // Relative traffic weight; weights are normalized over the experiment.
+  float weight = 2;
+  // Name of the RankingProfile this arm serves.
+  string ranking_profile = 3;
+}
+
+// A traffic-split experiment. Assignment is deterministic and stateless:
+// hash64(session_pseudo_id + salt) picks a weighted arm, identically on
+// every node. Queries without a session_pseudo_id do not participate.
+message Experiment {
+  string name = 1;
+  // Collection this experiment applies to; empty = global (all collections).
+  string collection = 2;
+  // Hash salt. Changing the salt reshuffles all assignments.
+  string salt = 3;
+  repeated ExperimentArm arms = 4;
+  // Metadata revision that produced this descriptor (watch resume point).
+  int64 revision = 5;
+}
+
+message PutExperimentRequest {
+  Experiment experiment = 1;
+}
+
+message PutExperimentResponse {
+  Experiment experiment = 1;
+}
+
+message DeleteExperimentRequest {
+  string name = 1;
+}
+
+message DeleteExperimentResponse {}
+
+message ListExperimentsRequest {
+  // Filter by collection; empty = all (including global experiments).
+  string collection = 1;
+}
+
+message ListExperimentsResponse {
+  repeated Experiment experiments = 1;
+}
+
+message PutRankingProfileRequest {
+  RankingProfile profile = 1;
+}
+
+message PutRankingProfileResponse {
+  RankingProfile profile = 1;
+}
+
+message DeleteRankingProfileRequest {
+  string name = 1;
+}
+
+message DeleteRankingProfileResponse {}
+
+message ListRankingProfilesRequest {}
+
+message ListRankingProfilesResponse {
+  repeated RankingProfile profiles = 1;
+}
+
+message WatchExperimentsRequest {
+  // Filter by collection; empty = all (including global experiments).
+  string collection = 1;
+  // Resume point: replay events with revision > from_revision. 0 = now.
+  // Fails with OUT_OF_RANGE if the revision has been compacted away.
+  int64 from_revision = 2;
+  // Emit a synthetic PUT event per existing experiment/profile first.
+  bool send_initial_state = 3;
+}
+
+// One experiment-metadata change (or initial-state snapshot entry).
+message ExperimentEvent {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_PUT = 1;
+    // Only `name` (inside the subject) and `revision` are meaningful.
+    TYPE_DELETE = 2;
+  }
+  Type type = 1;
+  oneof subject {
+    Experiment experiment = 2;
+    RankingProfile ranking_profile = 3;
+  }
+  int64 revision = 4;
+}
+
+// One metadata change (or initial-state snapshot entry).
+message CollectionEvent {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    // Collection created or updated (schema is immutable in v1alpha1, so
+    // updates are stats/topology/replication changes).
+    TYPE_PUT = 1;
+    // Collection dropped; only `name` and `revision` are meaningful.
+    TYPE_DELETE = 2;
+  }
+  Type type = 1;
+  string name = 2;
+  // Populated for TYPE_PUT.
+  Collection collection = 3;
+  int64 revision = 4;
+}
