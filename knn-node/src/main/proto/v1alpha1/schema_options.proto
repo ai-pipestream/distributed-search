@@ -1,0 +1,218 @@
+// ai.pipestream.search v1alpha1 -- schema-as-proto authoring options.
+//
+// Users author their document schema as an ordinary .proto file, annotate
+// fields with the custom options defined here, and register the compiled
+// FileDescriptorSet via CollectionAdminService.RegisterSchema. The server
+// compiles the annotated descriptor into the collection's CollectionSchema
+// (common.proto). See docs/rfc/SCHEMA_AS_PROTO.md for the full model.
+//
+// Example:
+//
+//   syntax = "proto3";
+//   package acme.catalog;
+//   import "v1alpha1/schema_options.proto";
+//
+//   message Product {
+//     option (ai.pipestream.search.v1alpha1.collection_defaults) = {
+//       default_analyzer: "english"
+//       dynamic_fields: DYNAMIC_FIELDS_STRICT
+//     };
+//
+//     optional string title = 1 [(ai.pipestream.search.v1alpha1.field) = {
+//       type: FIELD_TYPE_TEXT
+//       stored: true
+//       representations: [
+//         { name: "raw" type: FIELD_TYPE_KEYWORD doc_values: true },
+//         { name: "vec" type: FIELD_TYPE_VECTOR
+//           vector: { dims: 384 similarity: SIMILARITY_COSINE } }
+//       ]
+//     }];
+//
+//     repeated float embedding = 2 [(ai.pipestream.search.v1alpha1.field) = {
+//       type: FIELD_TYPE_VECTOR
+//       vector: { dims: 384 similarity: SIMILARITY_COSINE
+//                 hnsw: { max_conn: 16 beam_width: 100 } }
+//     }];
+//
+//     Vendor vendor = 3 [(ai.pipestream.search.v1alpha1.field) = {
+//       nested: NESTED_SEMANTICS_FLATTEN
+//     }];
+//   }
+//
+// Mechanics: custom options are proto2-style extensions of the option
+// messages in google/protobuf/descriptor.proto -- the one place proto3
+// permits `extend`. This file therefore imports descriptor.proto, which
+// the build resolves from protobuf-java's bundled well-known types
+// (extracted by the Quarkus gRPC codegen import scan configured in
+// application.properties). Extension numbers 56700-56701 sit in the
+// 50000-99999 range reserved for organization-internal use.
+//
+// ---------------------------------------------------------------------------
+// THE PRESENCE RULE -- read before authoring
+// ---------------------------------------------------------------------------
+// Indexable proto3 scalar fields MUST be declared `optional` (explicit
+// presence). A plain proto3 scalar cannot distinguish "absent" from
+// 0 / "" / false, so absent values would be silently indexed as zeros --
+// corrupting range queries, term statistics, and vector search. Schema
+// registration REJECTS any indexable scalar without explicit presence.
+// `repeated` fields and message-typed fields already have usable presence
+// semantics and are exempt.
+// ---------------------------------------------------------------------------
+
+syntax = "proto3";
+
+package ai.pipestream.search.v1alpha1;
+
+import "google/protobuf/descriptor.proto";
+
+option java_multiple_files = true;
+option java_package = "ai.pipestream.search.v1alpha1";
+option java_outer_classname = "SchemaOptionsProto";
+
+// How a leaf value is indexed.
+enum FieldType {
+  FIELD_TYPE_UNSPECIFIED = 0;
+  // Exact-match, unanalyzed. Valid sources: string, enum (indexed by
+  // enum value name).
+  FIELD_TYPE_KEYWORD = 1;
+  // Analyzed full text. Valid sources: string.
+  FIELD_TYPE_TEXT = 2;
+  // Integral numeric point. Valid sources: int32/int64/uint32/uint64/
+  // sint32/sint64/fixed/sfixed.
+  FIELD_TYPE_LONG = 3;
+  // Floating-point numeric point. Valid sources: float, double.
+  FIELD_TYPE_DOUBLE = 4;
+  // Millisecond-precision date. Valid sources: google.protobuf.Timestamp,
+  // or an integral scalar interpreted as epoch milliseconds.
+  FIELD_TYPE_DATE = 5;
+  // Valid sources: bool.
+  FIELD_TYPE_BOOL = 6;
+  // Dense vector; requires SearchField.vector params. Valid sources:
+  // repeated float.
+  FIELD_TYPE_VECTOR = 7;
+  // Stored for retrieval, not indexed at all. Valid sources: any leaf,
+  // including bytes (the only FieldType bytes may carry in v1).
+  FIELD_TYPE_STORED_ONLY = 8;
+}
+
+// Lucene postings granularity for TEXT/KEYWORD fields.
+enum IndexGranularity {
+  INDEX_GRANULARITY_UNSPECIFIED = 0; // Server default for the field type.
+  INDEX_GRANULARITY_DOCS = 1;        // Doc ids only.
+  INDEX_GRANULARITY_FREQS = 2;       // + term frequencies.
+  INDEX_GRANULARITY_POSITIONS = 3;   // + positions (phrase queries).
+  INDEX_GRANULARITY_OFFSETS = 4;     // + character offsets.
+}
+
+// How a message-typed field maps onto the index. Deliberately NO default:
+// the two choices have different query semantics, so schema registration
+// REJECTS message fields that leave this unspecified.
+enum NestedSemantics {
+  NESTED_SEMANTICS_UNSPECIFIED = 0;
+  // Child fields are indexed on the parent document as dotted paths
+  // ("vendor.name"). Cheap, but cross-field correlation within one
+  // repeated element is lost.
+  NESTED_SEMANTICS_FLATTEN = 1;
+  // Each element is indexed as a child document in the same block
+  // (Lucene block join). Preserves per-element correlation at the cost
+  // of extra documents and join-time work.
+  NESTED_SEMANTICS_BLOCK_JOIN = 2;
+}
+
+// HNSW construction parameters, in Lucene's vocabulary. These map onto
+// common.proto HnswParams at compilation: max_conn -> m,
+// beam_width -> ef_construction.
+message HnswOptions {
+  // Max connections per graph node (Lucene maxConn). 0 = server default.
+  int32 max_conn = 1;
+  // Construction-time candidate beam (Lucene beamWidth). 0 = server default.
+  int32 beam_width = 2;
+}
+
+// Parameters for FIELD_TYPE_VECTOR.
+message VectorOptions {
+  enum Similarity {
+    SIMILARITY_UNSPECIFIED = 0; // Defaults to COSINE.
+    SIMILARITY_COSINE = 1;
+    SIMILARITY_DOT_PRODUCT = 2;
+    SIMILARITY_EUCLIDEAN = 3;
+    SIMILARITY_MAX_INNER_PRODUCT = 4;
+  }
+  // Required; every indexed vector must match exactly.
+  int32 dims = 1;
+  Similarity similarity = 2;
+  HnswOptions hnsw = 3;
+}
+
+// One additional indexed form of the same source field (fan-out). The
+// representation is addressable as "<field>#<name>" in queries and in
+// DocumentField names on the ingest path. Values are derived from the
+// source value when possible (e.g. string -> KEYWORD); representations
+// whose value cannot be derived server-side (e.g. VECTOR from a string
+// source: v1 has no server-side embedding) must be supplied explicitly
+// by the client as a "<field>#<name>" DocumentField.
+message Representation {
+  // Suffix naming this representation; unique within the field.
+  string name = 1;
+  FieldType type = 2;
+  // Analyzer names, resolved against the server analyzer registry
+  // (built-ins like "standard"/"english", or registered pluggable
+  // analyzers). TEXT only. Empty = collection default_analyzer.
+  string analyzer = 3;
+  // Optional search-time analyzer override.
+  string search_analyzer = 4;
+  IndexGranularity index_options = 5;
+  optional bool doc_values = 6;
+  // Required when type = FIELD_TYPE_VECTOR.
+  VectorOptions vector = 7;
+}
+
+// Per-field indexing directives; attach as
+// [(ai.pipestream.search.v1alpha1.field) = {...}].
+// Fields without this option are neither indexed nor stored.
+message SearchField {
+  // Required for leaf fields (scalars, strings, enums, repeated float).
+  // Must be unset for message-typed fields, which use `nested` instead.
+  FieldType type = 1;
+  // Index-time analyzer name (TEXT only); resolved against the server
+  // analyzer registry. Empty = collection default_analyzer.
+  string analyzer = 2;
+  // Search-time analyzer override (TEXT only). Empty = same as `analyzer`.
+  string search_analyzer = 3;
+  // Store the source value for retrieval on hits.
+  optional bool stored = 4;
+  // Column-stride storage for sorting/faceting. Default: on for KEYWORD/
+  // LONG/DOUBLE/DATE/BOOL, off for TEXT, n/a for VECTOR/STORED_ONLY.
+  optional bool doc_values = 5;
+  IndexGranularity index_options = 6;
+  // Required when type = FIELD_TYPE_VECTOR.
+  VectorOptions vector = 7;
+  // Required (non-UNSPECIFIED) for message-typed fields; rejected on
+  // leaves.
+  NestedSemantics nested = 8;
+  // Additional indexed forms of this field (fan-out), e.g. one string
+  // source indexed as TEXT plus a "#raw" KEYWORD plus a "#vec" VECTOR.
+  repeated Representation representations = 9;
+}
+
+// Message-level collection defaults; attach to the root message as
+// option (ai.pipestream.search.v1alpha1.collection_defaults) = {...}.
+message CollectionDefaults {
+  // Default analyzer name for TEXT fields that do not set their own.
+  // Empty = "standard".
+  string default_analyzer = 1;
+  enum DynamicFields {
+    DYNAMIC_FIELDS_UNSPECIFIED = 0; // Defaults to STRICT.
+    // Unknown fields at ingest are rejected. The only policy in v1.
+    DYNAMIC_FIELDS_STRICT = 1;
+  }
+  DynamicFields dynamic_fields = 2;
+}
+
+extend google.protobuf.FieldOptions {
+  SearchField field = 56700;
+}
+
+extend google.protobuf.MessageOptions {
+  CollectionDefaults collection_defaults = 56701;
+}

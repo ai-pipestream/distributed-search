@@ -8,6 +8,7 @@ syntax = "proto3";
 
 package ai.pipestream.search.v1alpha1;
 
+import "google/protobuf/any.proto";
 import "google/rpc/status.proto";
 import "v1alpha1/common.proto";
 
@@ -67,7 +68,15 @@ message IndexDocument {
   // Document id; empty = server-assigned (returned in DocAck.doc_id).
   string doc_id = 3;
   // Typed field values; names and types must match the collection schema.
+  // This is the primary ingest form: schema-as-proto users send it via
+  // the generated flattening converters (see docs/rfc/SCHEMA_AS_PROTO.md).
   repeated DocumentField fields = 4;
+  // Convenience ingest for schema-as-proto collections: the document as
+  // the collection's registered root message, packed in an Any. The server
+  // unpacks it reflectively (DynamicMessage) against the registered
+  // descriptor set -- measurably slower than `fields`; do not use for bulk
+  // loads. Exactly one of `fields` / `typed_document` may be set.
+  google.protobuf.Any typed_document = 5;
 }
 
 // Requests a durability checkpoint: the server replies with a FlushAck

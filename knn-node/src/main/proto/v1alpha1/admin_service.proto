@@ -8,6 +8,7 @@ syntax = "proto3";
 
 package ai.pipestream.search.v1alpha1;
 
+import "google/protobuf/descriptor.proto";
 import "v1alpha1/common.proto";
 
 option java_multiple_files = true;
@@ -35,6 +36,27 @@ service CollectionAdminService {
   // client cancels. Shard relocation and replica changes surface as PUT
   // events with an updated descriptor.
   rpc WatchCollections (WatchCollectionsRequest) returns (stream CollectionEvent);
+
+  // --- Schema-as-proto -----------------------------------------------------
+  // Users may author their document schema as a .proto file annotated with
+  // the custom options in schema_options.proto, then register the compiled
+  // FileDescriptorSet here. The server compiles it into the collection's
+  // CollectionSchema. See docs/rfc/SCHEMA_AS_PROTO.md.
+
+  // Registers (or evolves) a collection's schema from an annotated proto
+  // descriptor. The submission is compiled and every difference against the
+  // current schema is classified (SchemaChange.Classification);
+  // registration applies only when all changes are WIRE_SAFE_LIVE.
+  // REQUIRES_REINDEX changes fail with FAILED_PRECONDITION (no online
+  // reindex in v1); REJECTED changes fail with INVALID_ARGUMENT. The
+  // collection must already exist (NOT_FOUND otherwise); registering
+  // against an empty schema classifies everything as new fields.
+  rpc RegisterSchema (RegisterSchemaRequest) returns (RegisterSchemaResponse);
+
+  // Dry-run of RegisterSchema: compiles and classifies without applying.
+  // Returns OK whenever the submission parses -- rejected changes are
+  // reported in the classification list, not as an RPC error.
+  rpc ValidateSchema (ValidateSchemaRequest) returns (ValidateSchemaResponse);
 
   // --- Experiments and ranking profiles -----------------------------------
   // Experiments split traffic across named arms, each pointing at a
@@ -138,6 +160,75 @@ message WatchCollectionsRequest {
   int64 from_revision = 2;
   // Emit a synthetic PUT event per existing collection before live events.
   bool send_initial_state = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Schema-as-proto
+// ---------------------------------------------------------------------------
+
+// A user-authored schema: the compiled descriptor set of a .proto file
+// annotated with schema_options.proto options, plus the root message that
+// defines the document shape.
+message SchemaSource {
+  // Output of `protoc --descriptor_set_out --include_imports` over the
+  // user's schema file(s). Must contain the root message and every
+  // transitive import except the well-known types and
+  // v1alpha1/schema_options.proto, which the server provides.
+  google.protobuf.FileDescriptorSet descriptor_set = 1;
+  // Fully qualified root message name, e.g. "acme.catalog.Product".
+  string root_message = 2;
+}
+
+// How one schema difference relates to existing data. The referee applies
+// BOTH rulebooks: proto wire compatibility AND Lucene index compatibility;
+// the stricter verdict wins (see docs/rfc/SCHEMA_AS_PROTO.md).
+message SchemaChange {
+  enum Classification {
+    CLASSIFICATION_UNSPECIFIED = 0;
+    // Applies immediately to a live collection (e.g. adding a field,
+    // changing only a search-time analyzer).
+    CLASSIFICATION_WIRE_SAFE_LIVE = 1;
+    // Legal, but existing documents would be invisible or wrong under the
+    // new schema (rename, type/analyzer change, nested-semantics change);
+    // requires a reindex, which v1 does not perform online.
+    CLASSIFICATION_REQUIRES_REINDEX = 2;
+    // Never legal: field-tag reuse, indexable proto3 scalar without
+    // explicit presence (`optional`), map fields, message field without
+    // explicit nested semantics, ...
+    CLASSIFICATION_REJECTED = 3;
+  }
+  Classification classification = 1;
+  // Dotted field path relative to the root message ("" = message-level).
+  string field = 2;
+  // Stable machine-readable reason, e.g. "NEW_FIELD", "FIELD_RENAMED",
+  // "TAG_REUSED", "IMPLICIT_PRESENCE", "MAP_FIELD", "ANALYZER_CHANGED",
+  // "SEARCH_ANALYZER_CHANGED", "NESTED_SEMANTICS_CHANGED".
+  string code = 3;
+  // Human-readable detail, e.g. 'type changed TEXT -> KEYWORD'.
+  string description = 4;
+}
+
+message RegisterSchemaRequest {
+  string collection = 1;
+  SchemaSource source = 2;
+}
+
+message RegisterSchemaResponse {
+  // Updated descriptor, including the compiled CollectionSchema.
+  Collection collection = 1;
+  // The applied changes (all WIRE_SAFE_LIVE by definition).
+  repeated SchemaChange changes = 2;
+}
+
+message ValidateSchemaRequest {
+  string collection = 1;
+  SchemaSource source = 2;
+}
+
+message ValidateSchemaResponse {
+  // What the submission compiles to (dry-run; nothing is applied).
+  CollectionSchema compiled = 1;
+  repeated SchemaChange changes = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,8 +346,8 @@ message ExperimentEvent {
 message CollectionEvent {
   enum Type {
     TYPE_UNSPECIFIED = 0;
-    // Collection created or updated (schema is immutable in v1alpha1, so
-    // updates are stats/topology/replication changes).
+    // Collection created or updated: stats/topology/replication changes,
+    // or a wire-safe schema evolution applied via RegisterSchema.
     TYPE_PUT = 1;
     // Collection dropped; only `name` and `revision` are meaningful.
     TYPE_DELETE = 2;
