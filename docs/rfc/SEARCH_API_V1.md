@@ -1,8 +1,11 @@
 # RFC: Public Search API v1 (`ai.pipestream.search.v1alpha1`)
 
 - **Status:** Draft
-- **Proto files:** `knn-node/src/main/proto/v1alpha1/{common,search_service,index_service,admin_service}.proto`
+- **Proto files:** `knn-node/src/main/proto/v1alpha1/{common,search_service,index_service,admin_service,schema_options}.proto`
 - **Package:** `ai.pipestream.search.v1alpha1` (graduates to `.v1` when frozen; see [Versioning](#7-versioning-and-compatibility))
+- **Annex:** [SCHEMA_AS_PROTO.md](SCHEMA_AS_PROTO.md) — authoring document
+  schemas as annotated .proto files (`RegisterSchema`/`ValidateSchema`,
+  custom field options, evolution classification)
 
 This RFC defines the first public wire surface of the engine. The current
 protos (`knn.collab.KnnNodeService`, `ai.pipestream.index.v1.IndexService`)
