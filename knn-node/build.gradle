@@ -37,6 +37,15 @@ dependencies {
         implementation fileTree(dir: luceneCoreJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
         implementation fileTree(dir: luceneSandboxJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
     }
+    // Additional Lucene modules for the query compiler: analyzers (english/keyword/...)
+    // and the classic QueryParser. Same locally-built tree as lucene-core above;
+    // override with -PluceneModuleJarDirs=<dir1>,<dir2>.
+    def luceneModuleJarDirs = project.findProperty('luceneModuleJarDirs')?.split(',')
+            ?: ['/work/worktrees/lucene-cross-shard-optimistic/lucene/analysis/common/build/libs',
+                '/work/worktrees/lucene-cross-shard-optimistic/lucene/queryparser/build/libs']
+    luceneModuleJarDirs.each { moduleDir ->
+        implementation fileTree(dir: moduleDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
+    }
     testImplementation 'io.quarkus:quarkus-junit'
     testImplementation 'io.rest-assured:rest-assured'
 }
