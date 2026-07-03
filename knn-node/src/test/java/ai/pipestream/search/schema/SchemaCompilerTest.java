@@ -248,4 +248,30 @@ class SchemaCompilerTest {
     return changes.stream().filter(c -> c.getCode().equals(code)).findFirst()
         .orElseThrow(() -> new AssertionError("missing change " + code + " in " + changes));
   }
+
+  @Test
+  void rejectsTypeRedefinedAcrossFiles() throws Exception {
+    // Two files each declare t.Doc, with different shapes. Each file is
+    // individually valid; whichever resolves first would silently win.
+    DescriptorProto.Builder docA = DescriptorProto.newBuilder().setName("Doc");
+    addOptionalScalar(docA, "title", 1, FieldDescriptorProto.Type.TYPE_STRING, TEXT);
+    DescriptorProto.Builder docB = DescriptorProto.newBuilder().setName("Doc");
+    addOptionalScalar(docB, "title", 1, FieldDescriptorProto.Type.TYPE_INT64, LONG);
+
+    FileDescriptorSet set = FileDescriptorSet.newBuilder()
+        .addFile(FileDescriptorProto.newBuilder()
+            .setName("a.proto").setPackage("t").setSyntax("proto3").addMessageType(docA))
+        .addFile(FileDescriptorProto.newBuilder()
+            .setName("b.proto").setPackage("t").setSyntax("proto3").addMessageType(docB))
+        .build();
+
+    SchemaCompiler.Result r = SchemaCompiler.compile(set, "t.Doc");
+    assertEquals(1, r.rejections().size());
+    SchemaChange c = r.rejections().get(0);
+    assertEquals("TYPE_REDEFINED", c.getCode());
+    assertEquals("t.Doc", c.getField());
+    assertTrue(c.getDescription().contains("a.proto") && c.getDescription().contains("b.proto"),
+        () -> "should name both sources: " + c.getDescription());
+    assertEquals(0, r.schema().fields().size(), "no schema is produced on conflict");
+  }
 }

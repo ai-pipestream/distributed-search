@@ -55,8 +55,51 @@ public final class SchemaCompiler {
     return FileDescriptorSet.parseFrom(bytes, registry);
   }
 
+  /**
+   * Rejects any fully qualified type redefined with a different shape across
+   * the files of the set. Each file may be individually valid, so buildFrom
+   * accepts them; whichever definition resolves first would silently win.
+   * Byte-equality on compiled declarations ignores comments/whitespace.
+   * (Same check as ProtobufFqnConflictDetector in Apicurio and
+   * ProtoTypeConflictDetector in quarkus-grpc-zero.)
+   */
+  public static List<SchemaChange> checkTypeConflicts(FileDescriptorSet set) {
+    List<SchemaChange> conflicts = new ArrayList<>();
+    Map<String, byte[]> seenBytes = new HashMap<>();
+    Map<String, String> seenSource = new HashMap<>();
+    for (FileDescriptorProto file : set.getFileList()) {
+      String prefix = file.getPackage().isEmpty() ? "" : file.getPackage() + ".";
+      for (com.google.protobuf.DescriptorProtos.DescriptorProto m : file.getMessageTypeList()) {
+        checkDeclaration(prefix + m.getName(), m.toByteArray(), file.getName(), seenBytes, seenSource, conflicts);
+        for (com.google.protobuf.DescriptorProtos.DescriptorProto n : m.getNestedTypeList()) {
+          checkDeclaration(prefix + m.getName() + "." + n.getName(), n.toByteArray(), file.getName(),
+              seenBytes, seenSource, conflicts);
+        }
+      }
+      for (com.google.protobuf.DescriptorProtos.EnumDescriptorProto e : file.getEnumTypeList()) {
+        checkDeclaration(prefix + e.getName(), e.toByteArray(), file.getName(), seenBytes, seenSource, conflicts);
+      }
+    }
+    return conflicts;
+  }
+
+  private static void checkDeclaration(String fqn, byte[] bytes, String source,
+      Map<String, byte[]> seenBytes, Map<String, String> seenSource, List<SchemaChange> conflicts) {
+    byte[] existing = seenBytes.putIfAbsent(fqn, bytes);
+    if (existing == null) {
+      seenSource.put(fqn, source);
+    } else if (!java.util.Arrays.equals(existing, bytes)) {
+      conflicts.add(reject(fqn, "TYPE_REDEFINED",
+          "type declared in " + seenSource.get(fqn) + " is redefined differently in " + source));
+    }
+  }
+
   /** Compiles the root message of an in-memory descriptor set. */
   public static Result compile(FileDescriptorSet set, String rootMessageFullName) throws Descriptors.DescriptorValidationException {
+    List<SchemaChange> conflicts = checkTypeConflicts(set);
+    if (!conflicts.isEmpty()) {
+      return new Result(new CompiledSchema(rootMessageFullName, "standard", List.of()), conflicts);
+    }
     Map<String, FileDescriptor> built = new HashMap<>();
     FileDescriptor last = null;
     for (FileDescriptorProto fdp : set.getFileList()) {
