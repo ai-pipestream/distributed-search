@@ -22,14 +22,21 @@ dependencies {
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-smallrye-health'
     implementation 'io.quarkus:quarkus-scheduler'
-    // Lucene jars: pass -PluceneJarDir=<dir> to compile against a locally-built Lucene
-    // (e.g. -PluceneJarDir=/work/opensearch-grpc-knn/lucene-dc-short-circuit/lucene/core/build/libs).
-    // All jars in the dir are included. -PluceneJar=<file> is still honored for existing workflows.
+    // Compile against both Lucene core and sandbox. The shared-floor API intentionally lives in
+    // sandbox; depending on a forked core class would make the distributed engine unreleasable.
+    // Override these paths with -PluceneCoreJarDir and -PluceneSandboxJarDir in other workspaces.
     def luceneJar = project.findProperty('luceneJar')
-    def luceneJarDir = project.findProperty('luceneJarDir') ?: '/work/opensearch-grpc-knn/lucene/lucene/core/build/libs'
-    implementation luceneJar != null
-            ? files(luceneJar)
-            : fileTree(dir: luceneJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
+    def luceneCoreJarDir = project.findProperty('luceneCoreJarDir')
+            ?: project.findProperty('luceneJarDir')
+            ?: '/work/worktrees/lucene-cross-shard-optimistic/lucene/core/build/libs'
+    def luceneSandboxJarDir = project.findProperty('luceneSandboxJarDir')
+            ?: '/work/worktrees/lucene-cross-shard-optimistic/lucene/sandbox/build/libs'
+    if (luceneJar != null) {
+        implementation files(luceneJar)
+    } else {
+        implementation fileTree(dir: luceneCoreJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
+        implementation fileTree(dir: luceneSandboxJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
+    }
     testImplementation 'io.quarkus:quarkus-junit'
     testImplementation 'io.rest-assured:rest-assured'
 }

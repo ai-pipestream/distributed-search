@@ -1,5 +1,7 @@
 package ai.pipestream.search.index;
 
+import ai.pipestream.index.v1.DeleteDocumentRequest;
+import ai.pipestream.index.v1.DeleteDocumentResponse;
 import ai.pipestream.index.v1.IndexDocumentRequest;
 import ai.pipestream.index.v1.IndexDocumentResponse;
 import ai.pipestream.index.v1.MutinyIndexServiceGrpc;
@@ -71,10 +73,14 @@ public class ShardRouter {
         // Try to find remote owner for this shard
         Optional<ShardOwner> owner = findOwner(targetShard, request.getCollection());
         if (owner.isEmpty()) {
-            LOG.warnf("No remote owner found for shard %d of collection '%s' — indexing locally",
+            LOG.warnf("No remote owner found for shard %d of collection '%s'",
                     targetShard, request.getCollection());
-            return Uni.createFrom().item(() -> localIndexFn.apply(request))
-                    .runSubscriptionOn(io.smallrye.mutiny.infrastructure.Infrastructure.getDefaultWorkerPool());
+            return Uni.createFrom().item(IndexDocumentResponse.newBuilder()
+                    .setSuccess(false)
+                    .setDocId(request.getDocId())
+                    .setShardId(targetShard)
+                    .setError("No primary owner is available for shard " + targetShard)
+                    .build());
         }
 
         // Forward to remote owner
@@ -85,6 +91,33 @@ public class ShardRouter {
         MutinyIndexServiceGrpc.MutinyIndexServiceStub stub =
                 MutinyIndexServiceGrpc.newMutinyStub(channelCache.getOrCreate(remote.host, remote.port));
         return stub.indexDocument(request);
+    }
+
+    /** Route a delete through the same primary-owner decision as indexing. */
+    public Uni<DeleteDocumentResponse> routeAndDelete(
+            DeleteDocumentRequest request,
+            Function<DeleteDocumentRequest, DeleteDocumentResponse> localDeleteFn) {
+        CollectionConfig config = collections.getConfig(request.getCollection());
+        if (config == null) {
+            return Uni.createFrom().item(DeleteDocumentResponse.newBuilder().setFound(false).build());
+        }
+
+        int targetShard = collections.routeToShard(request.getDocId(), config.numShards());
+        if (singleNode || targetShard == localShardId || !clusterBootstrap.isEnabled()) {
+            return Uni.createFrom().item(() -> localDeleteFn.apply(request))
+                    .runSubscriptionOn(io.smallrye.mutiny.infrastructure.Infrastructure.getDefaultWorkerPool());
+        }
+
+        Optional<ShardOwner> owner = findOwner(targetShard, request.getCollection());
+        if (owner.isEmpty()) {
+            LOG.warnf("No remote owner found for delete from shard %d of collection '%s'",
+                    targetShard, request.getCollection());
+            return Uni.createFrom().item(DeleteDocumentResponse.newBuilder().setFound(false).build());
+        }
+
+        ShardOwner remote = owner.get();
+        return MutinyIndexServiceGrpc.newMutinyStub(channelCache.getOrCreate(remote.host, remote.port))
+                .deleteDocument(request);
     }
 
     /**
@@ -105,7 +138,9 @@ public class ShardRouter {
             Optional<ShardMetadata> metaOpt = cluster.metadata(member);
             if (metaOpt.isPresent()) {
                 ShardMetadata meta = metaOpt.get();
-                if (meta.shardId() == shardId && meta.isPrimary()) {
+                if (meta.shardId() == shardId
+                        && meta.isPrimary()
+                        && meta.collection().equals(collection)) {
                     String host = parseHost(member.address());
                     int port = meta.grpcPort() > 0 ? meta.grpcPort() : parsePort(member.address());
                     return Optional.of(new ShardOwner(host, port, shardId));

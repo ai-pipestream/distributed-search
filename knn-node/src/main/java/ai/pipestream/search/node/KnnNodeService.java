@@ -15,18 +15,19 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.StoredFields;
-import org.apache.lucene.search.CollaborativeKnnCollector;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.search.knn.CollaborativeKnnCollectorManager;
 import org.apache.lucene.search.knn.KnnCollectorManager;
 import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.search.knn.TopKnnCollectorManager;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.sandbox.search.knn.FloorAwareKnnCollector;
+import org.apache.lucene.sandbox.search.knn.GlobalKnnFloor;
+import org.apache.lucene.sandbox.search.knn.SharedFloorKnnCollectorManager;
 import org.eclipse.microprofile.config.ConfigProvider;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
@@ -40,7 +41,6 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.atomic.LongAccumulator;
 
 @Singleton
 @GrpcService
@@ -78,10 +78,17 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
     /** Cached read-only reader for the external index. Closed on shutdown. */
     private volatile DirectoryReader externalReader;
 
-    private final Map<String, LongAccumulator> localSearches = new ConcurrentHashMap<>();
+    private final Map<String, GlobalKnnFloor> localSearches = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> searchVisits = new ConcurrentHashMap<>();
     private final Map<String, AtomicReference<byte[]>> searchHints = new ConcurrentHashMap<>();
     private volatile int indexVectorDimension = -1;
+
+    @ConfigProperty(name = "knn.shared-floor.global-share", defaultValue = "1.0")
+    float sharedFloorGlobalShare;
+
+    /** Disabled until the coordinator consumes neighborhood hints in a pruning decision. */
+    @ConfigProperty(name = "knn.topology-sketch.enabled", defaultValue = "false")
+    boolean topologySketchEnabled;
 
     public static class SearchHit {
         public long globalId;
@@ -245,6 +252,18 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
     public Multi<SearchResponse> search(SearchRequest request) {
         return Multi.createFrom().<SearchResponse>emitter(emitter -> {
             String qid = request.getQueryId();
+            if (request.getK() <= 0) {
+                emitter.fail(new IllegalArgumentException("k must be positive"));
+                return;
+            }
+            if (request.getVectorCount() == 0) {
+                emitter.fail(new IllegalArgumentException("query vector must not be empty"));
+                return;
+            }
+            if (!pureMode && request.getK() > Integer.MAX_VALUE / 5) {
+                emitter.fail(new IllegalArgumentException("k is too large"));
+                return;
+            }
             String path = resolveIndexPath();
             int shardId = resolveShardId();
             long startTime = System.currentTimeMillis();
@@ -252,25 +271,28 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
             boolean externalIndex = externalIndexPath.isPresent();
             String vectorField = externalIndex ? externalIndexVectorField : ENGINE_VECTOR_FIELD;
 
-            // Pure mode: exactly the caller's k, no visit cap — mirrors stock Lucene behavior.
-            int internalK = pureMode ? request.getK() : request.getK() * 5;
+            // A shared floor and the coordinator must use the same k. Oversampling remains
+            // available for ordinary searches, but collaborative searches use the request k until
+            // the coordinator also exchanges bounded score batches for an oversampled candidate set.
+            int internalK = (pureMode || request.getCollaborative()) ? request.getK() : request.getK() * 5;
             int visitLimit = pureMode ? Integer.MAX_VALUE : internalK * 10;
 
             LOG.infof("[DIAGNOSTIC] Shard %d starting search for %s (K=%d, internalK=%d, visitLimit=%d, pure=%b, external=%b)",
                 shardId, qid, request.getK(), internalK, visitLimit, pureMode, externalIndex);
 
-            LongAccumulator acc = new LongAccumulator(Long::max, Long.MIN_VALUE);
+            GlobalKnnFloor sharedFloor = request.getCollaborative() ? new GlobalKnnFloor(internalK) : null;
             AtomicLong visits = new AtomicLong(0);
             AtomicReference<byte[]> hint = new AtomicReference<>(null);
             
             if (request.getCollaborative()) {
-                localSearches.put(qid, acc);
+                localSearches.put(qid, sharedFloor);
                 searchVisits.put(qid, visits);
                 searchHints.put(qid, hint);
             }
 
             DirectoryReader reader = null;
             boolean ownsReader = false;
+            boolean acquiredCollectionReader = false;
             try {
                 // Open reader: external index if configured, else from CollectionManager
                 // if collection specified, else legacy path
@@ -280,7 +302,7 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                     ownsReader = false; // cached, closed on shutdown
                 } else if (!collectionName.isEmpty()) {
                     reader = collectionManager.getReader(collectionName, shardId);
-                    ownsReader = false; // CollectionManager owns it
+                    acquiredCollectionReader = true;
                 } else {
                     reader = DirectoryReader.open(FSDirectory.open(Path.of(path)));
                     ownsReader = true;
@@ -288,7 +310,25 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 final DirectoryReader theReader = reader;
                 IndexSearcher searcher = new IndexSearcher(theReader);
                 float[] vector = new float[request.getVectorCount()];
-                for (int i = 0; i < request.getVectorCount(); i++) vector[i] = request.getVector(i);
+                for (int i = 0; i < request.getVectorCount(); i++) {
+                    float value = request.getVector(i);
+                    if (Float.isFinite(value) == false) {
+                        throw new IllegalArgumentException("query vector must contain only finite values");
+                    }
+                    vector[i] = value;
+                }
+                int expectedDimension = indexVectorDimension;
+                if (!collectionName.isEmpty()) {
+                    var config = collectionManager.getConfig(collectionName);
+                    if (config == null) {
+                        throw new IllegalArgumentException("Collection not found: " + collectionName);
+                    }
+                    expectedDimension = config.vectorDimension();
+                }
+                if (expectedDimension > 0 && vector.length != expectedDimension) {
+                    throw new IllegalArgumentException(
+                            "query vector dimension mismatch: expected " + expectedDimension + ", got " + vector.length);
+                }
 
                 final String idField = externalIndex ? EXTERNAL_ID_FIELD : null;
                 // Reader-global doc ids already emitted for this query, shared across
@@ -297,7 +337,14 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
 
                 KnnCollectorManager manager;
                 if (request.getCollaborative()) {
-                    manager = new CollaborativeKnnCollectorManager(internalK, acc);
+                    manager = new SharedFloorKnnCollectorManager(
+                            internalK,
+                            sharedFloor,
+                            FloorAwareKnnCollector.DEFAULT_GREEDINESS,
+                            SharedFloorKnnCollectorManager.DEFAULT_FLOOR_ACTIVATION_K,
+                            FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS,
+                            FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL,
+                            sharedFloorGlobalShare);
                 } else {
                     manager = new TopKnnCollectorManager(internalK, searcher);
                 }
@@ -307,7 +354,24 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                     public KnnCollector newCollector(int ignored, KnnSearchStrategy strategy, LeafReaderContext context) throws IOException {
                         return new StreamingKnnCollector(manager.newCollector(visitLimit, strategy, context),
                                                        emitter, shardId, theReader.storedFields(), theReader.leaves(), visits, hint, request.getK(),
-                                                       vectorField, idField, !pureMode, context.docBase, emittedDocs);
+                                                       vectorField, idField, topologySketchEnabled, context.docBase, emittedDocs);
+                    }
+
+                    @Override
+                    public KnnCollector newOptimisticCollector(
+                            int ignored,
+                            KnnSearchStrategy strategy,
+                            LeafReaderContext context,
+                            int perLeafK) throws IOException {
+                        return new StreamingKnnCollector(
+                                manager.newOptimisticCollector(visitLimit, strategy, context, perLeafK),
+                                emitter, shardId, theReader.storedFields(), theReader.leaves(), visits, hint,
+                                request.getK(), vectorField, idField, topologySketchEnabled, context.docBase, emittedDocs);
+                    }
+
+                    @Override
+                    public boolean isOptimistic() {
+                        return manager.isOptimistic();
                     }
                 };
 
@@ -352,6 +416,13 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 if (ownsReader) {
                     try { reader.close(); } catch (IOException ignored) {}
                 }
+                if (acquiredCollectionReader && reader != null) {
+                    try {
+                        collectionManager.releaseReader(reader);
+                    } catch (IOException e) {
+                        LOG.warnf(e, "Failed to release collection reader for query %s", qid);
+                    }
+                }
                 if (emitter.isCancelled()) {
                     LOG.warnf("[DIAGNOSTIC] Query %s was CANCELLED by gRPC before completion!", qid);
                 }
@@ -368,14 +439,14 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
     public Multi<CoordinateResponse> coordinate(Multi<CoordinateRequest> updatesFromLeader) {
         return updatesFromLeader.onItem().transform(update -> {
             String qid = update.getQueryId();
-            LongAccumulator acc = localSearches.get(qid);
+            GlobalKnnFloor floorState = localSearches.get(qid);
             AtomicLong visits = searchVisits.get(qid);
             AtomicReference<byte[]> hintRef = searchHints.get(qid);
             
-            if (acc != null && Float.isFinite(update.getMinScore()) && update.getMinScore() > Float.NEGATIVE_INFINITY) {
-                float oldVal = CollaborativeKnnCollector.toScore(acc.get());
-                acc.accumulate(CollaborativeKnnCollector.encode(Integer.MAX_VALUE, update.getMinScore()));
-                float newVal = CollaborativeKnnCollector.toScore(acc.get());
+            if (floorState != null && Float.isFinite(update.getMinScore()) && update.getMinScore() > Float.NEGATIVE_INFINITY) {
+                float oldVal = floorState.floor();
+                floorState.advertise(update.getMinScore());
+                float newVal = floorState.floor();
                 if (newVal > oldVal) {
                     LOG.infof("[DIAGNOSTIC] Query %s updated local floor to GLOBAL value: %.6f (Visited so far: %d)", 
                         qid, newVal, visits != null ? visits.get() : -1);
@@ -383,11 +454,8 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
             }
             
             float floor = Float.NEGATIVE_INFINITY;
-            if (acc != null) {
-                long current = acc.get();
-                if (current != Long.MIN_VALUE) {
-                    floor = CollaborativeKnnCollector.toScore(current);
-                }
+            if (floorState != null) {
+                floor = floorState.floor();
             }
             
             CoordinateResponse.Builder resp = CoordinateResponse.newBuilder()

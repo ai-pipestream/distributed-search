@@ -115,6 +115,18 @@ public class IndexServiceTest {
                 .anyMatch(c -> c.getName().equals(COLLECTION)));
     }
 
+    @Test
+    @Order(4)
+    void testRejectsUnsafeCollectionName() {
+        assertThrows(Exception.class, () -> indexService.createCollection(
+                CreateCollectionRequest.newBuilder()
+                        .setName("../escape")
+                        .setVectorDimension(DIMENSION)
+                        .setNumShards(1)
+                        .build()
+        ).await().atMost(Duration.ofSeconds(10)));
+    }
+
     // --- Unary Indexing ---
 
     @Test
@@ -307,6 +319,19 @@ public class IndexServiceTest {
                 DeleteDocumentRequest.newBuilder()
                         .setCollection("nonexistent")
                         .setDocId("whatever")
+                        .build()
+        ).await().atMost(Duration.ofSeconds(10));
+
+        assertFalse(deleteResp.getFound());
+    }
+
+    @Test
+    @Order(32)
+    void testDeleteDocumentMissingIdReturnsNotFound() {
+        DeleteDocumentResponse deleteResp = indexService.deleteDocument(
+                DeleteDocumentRequest.newBuilder()
+                        .setCollection(COLLECTION)
+                        .setDocId("does-not-exist")
                         .build()
         ).await().atMost(Duration.ofSeconds(10));
 

@@ -84,9 +84,9 @@ public final class SchemaValidator {
 
     for (Map.Entry<String, CompiledField> e : oldByIdentity.entrySet()) {
       if (!newByIdentity.containsKey(e.getKey())) {
-        changes.add(change(Classification.CLASSIFICATION_REQUIRES_REINDEX, e.getValue().indexName(),
+        changes.add(change(Classification.CLASSIFICATION_WIRE_SAFE_LIVE, e.getValue().indexName(),
             "FIELD_REMOVED", "existing documents still carry this field; removal without reindex leaves "
-                + "unreachable index data and surprising query behavior"));
+                + "stale data that is no longer queryable (reindex is optional for cleanup)"));
       }
     }
     return changes;

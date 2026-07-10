@@ -70,17 +70,36 @@ public final class SchemaCompiler {
     for (FileDescriptorProto file : set.getFileList()) {
       String prefix = file.getPackage().isEmpty() ? "" : file.getPackage() + ".";
       for (com.google.protobuf.DescriptorProtos.DescriptorProto m : file.getMessageTypeList()) {
-        checkDeclaration(prefix + m.getName(), m.toByteArray(), file.getName(), seenBytes, seenSource, conflicts);
-        for (com.google.protobuf.DescriptorProtos.DescriptorProto n : m.getNestedTypeList()) {
-          checkDeclaration(prefix + m.getName() + "." + n.getName(), n.toByteArray(), file.getName(),
-              seenBytes, seenSource, conflicts);
-        }
+        checkMessageDeclarations(prefix + m.getName(), m, file.getName(), seenBytes, seenSource, conflicts);
       }
       for (com.google.protobuf.DescriptorProtos.EnumDescriptorProto e : file.getEnumTypeList()) {
         checkDeclaration(prefix + e.getName(), e.toByteArray(), file.getName(), seenBytes, seenSource, conflicts);
       }
     }
     return conflicts;
+  }
+
+  private static void checkMessageDeclarations(
+      String fqn,
+      com.google.protobuf.DescriptorProtos.DescriptorProto message,
+      String source,
+      Map<String, byte[]> seenBytes,
+      Map<String, String> seenSource,
+      List<SchemaChange> conflicts) {
+    checkDeclaration(fqn, message.toByteArray(), source, seenBytes, seenSource, conflicts);
+    for (com.google.protobuf.DescriptorProtos.DescriptorProto nested : message.getNestedTypeList()) {
+      checkMessageDeclarations(
+          fqn + "." + nested.getName(), nested, source, seenBytes, seenSource, conflicts);
+    }
+    for (com.google.protobuf.DescriptorProtos.EnumDescriptorProto nestedEnum : message.getEnumTypeList()) {
+      checkDeclaration(
+          fqn + "." + nestedEnum.getName(),
+          nestedEnum.toByteArray(),
+          source,
+          seenBytes,
+          seenSource,
+          conflicts);
+    }
   }
 
   private static void checkDeclaration(String fqn, byte[] bytes, String source,
@@ -101,23 +120,40 @@ public final class SchemaCompiler {
       return new Result(new CompiledSchema(rootMessageFullName, "standard", List.of()), conflicts);
     }
     Map<String, FileDescriptor> built = new HashMap<>();
-    FileDescriptor last = null;
-    for (FileDescriptorProto fdp : set.getFileList()) {
-      List<FileDescriptor> deps = new ArrayList<>();
-      for (String dep : fdp.getDependencyList()) {
-        FileDescriptor d = built.get(dep);
-        if (d == null && dep.equals("google/protobuf/descriptor.proto")) {
-          d = com.google.protobuf.DescriptorProtos.getDescriptor();
-        }
-        if (d == null && dep.equals("google/protobuf/timestamp.proto")) {
-          d = com.google.protobuf.TimestampProto.getDescriptor();
-        }
-        if (d != null) {
+    List<FileDescriptorProto> pending = new ArrayList<>(set.getFileList());
+    while (pending.isEmpty() == false) {
+      boolean madeProgress = false;
+      for (java.util.Iterator<FileDescriptorProto> it = pending.iterator(); it.hasNext(); ) {
+        FileDescriptorProto fdp = it.next();
+        List<FileDescriptor> deps = new ArrayList<>();
+        boolean unresolved = false;
+        for (String dep : fdp.getDependencyList()) {
+          FileDescriptor d = built.get(dep);
+          if (d == null && dep.equals("google/protobuf/descriptor.proto")) {
+            d = com.google.protobuf.DescriptorProtos.getDescriptor();
+          }
+          if (d == null && dep.equals("google/protobuf/timestamp.proto")) {
+            d = com.google.protobuf.TimestampProto.getDescriptor();
+          }
+          if (d == null) {
+            unresolved = true;
+            break;
+          }
           deps.add(d);
         }
+        if (unresolved) {
+          continue;
+        }
+        FileDescriptor descriptor = FileDescriptor.buildFrom(fdp, deps.toArray(new FileDescriptor[0]));
+        built.put(fdp.getName(), descriptor);
+        it.remove();
+        madeProgress = true;
       }
-      last = FileDescriptor.buildFrom(fdp, deps.toArray(new FileDescriptor[0]));
-      built.put(fdp.getName(), last);
+      if (madeProgress == false) {
+        throw new IllegalArgumentException(
+            "descriptor set has unresolved or cyclic dependencies: "
+                + pending.stream().map(FileDescriptorProto::getName).toList());
+      }
     }
     Descriptor root = null;
     for (FileDescriptor fd : built.values()) {

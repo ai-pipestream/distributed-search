@@ -190,7 +190,7 @@ public class CollectionManager {
      * Get a NRT DirectoryReader for the given collection shard.
      * Opens from IndexWriter if available (NRT), otherwise opens directly from directory.
      */
-    public DirectoryReader getReader(String collection, int shardId) throws IOException {
+    public synchronized DirectoryReader getReader(String collection, int shardId) throws IOException {
         String key = writerKey(collection, shardId);
 
         DirectoryReader currentReader = readers.get(key);
@@ -199,9 +199,13 @@ public class CollectionManager {
             DirectoryReader newReader = DirectoryReader.openIfChanged(currentReader);
             if (newReader != null) {
                 readers.put(key, newReader);
+                // The cache owns one reference. Active searches acquire their own reference below,
+                // so replacing the cached reader cannot close a reader that is still in use.
                 currentReader.close();
+                newReader.incRef();
                 return newReader;
             }
+            currentReader.incRef();
             return currentReader;
         }
 
@@ -218,7 +222,13 @@ public class CollectionManager {
             reader = DirectoryReader.open(FSDirectory.open(dir));
         }
         readers.put(key, reader);
+        reader.incRef();
         return reader;
+    }
+
+    /** Release a reader previously acquired through {@link #getReader(String, int)}. */
+    public void releaseReader(DirectoryReader reader) throws IOException {
+        reader.decRef();
     }
 
     /**

@@ -18,6 +18,8 @@ import jakarta.inject.Singleton;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.TermQuery;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
@@ -75,7 +77,9 @@ public class IndexNodeService implements IndexService {
     @Override
     public Multi<IndexDocumentResponse> streamIndex(Multi<IndexDocumentRequest> requests) {
         return requests
-                .onItem().transformToUniAndMerge(request ->
+                // Preserve transport backpressure and keep embedding/index work bounded. Shard-level
+                // batching can raise this deliberately once the durability contract is in place.
+                .onItem().transformToUniAndConcatenate(request ->
                         router.routeAndIndex(request, this::indexSingleSafe)
                                 .onFailure().recoverWithItem(e -> {
                                     LOG.debugf(e, "Stream index failed for doc %s: %s", request.getDocId(), e.getMessage());
@@ -90,26 +94,7 @@ public class IndexNodeService implements IndexService {
 
     @Override
     public Uni<DeleteDocumentResponse> deleteDocument(DeleteDocumentRequest request) {
-        return Uni.createFrom().item(() -> {
-            try {
-                CollectionConfig config = collections.getConfig(request.getCollection());
-                if (config == null) {
-                    return DeleteDocumentResponse.newBuilder().setFound(false).build();
-                }
-
-                // Delete from all shards (doc could have been re-routed)
-                boolean deleted = false;
-                int shardId = collections.routeToShard(request.getDocId(), config.numShards());
-                IndexWriter writer = collections.getWriter(request.getCollection(), shardId);
-                long seqNo = writer.deleteDocuments(new Term("doc_id", request.getDocId()));
-                deleted = seqNo >= 0;
-
-                return DeleteDocumentResponse.newBuilder().setFound(deleted).build();
-            } catch (Exception e) {
-                LOG.errorf(e, "Failed to delete doc %s", request.getDocId());
-                return DeleteDocumentResponse.newBuilder().setFound(false).build();
-            }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        return router.routeAndDelete(request, this::deleteSingleSafe);
     }
 
     // --- Collection CRUD ---
@@ -129,8 +114,10 @@ public class IndexNodeService implements IndexService {
                         request.getEmbeddingModel()
                 );
 
-                // Broadcast to cluster peers (fire-and-forget)
-                broadcastCreateCollection(request);
+                // Cluster recipients apply the same idempotent mutation but never rebroadcast it.
+                if (!request.getClusterPropagation()) {
+                    broadcastCreateCollection(request.toBuilder().setClusterPropagation(true).build());
+                }
 
                 return CreateCollectionResponse.newBuilder()
                         .setCollection(toCollectionInfo(config))
@@ -172,8 +159,10 @@ public class IndexNodeService implements IndexService {
             try {
                 boolean deleted = collections.deleteCollection(request.getName());
 
-                // Broadcast to cluster peers (fire-and-forget)
-                broadcastDeleteCollection(request);
+                // Cluster recipients apply the same idempotent mutation but never rebroadcast it.
+                if (!request.getClusterPropagation()) {
+                    broadcastDeleteCollection(request.toBuilder().setClusterPropagation(true).build());
+                }
 
                 return DeleteCollectionResponse.newBuilder().setSuccess(deleted).build();
             } catch (Exception e) {
@@ -199,6 +188,33 @@ public class IndexNodeService implements IndexService {
                     .setDocId(request.getDocId())
                     .setError(e.getMessage())
                     .build();
+        }
+    }
+
+    private DeleteDocumentResponse deleteSingleSafe(DeleteDocumentRequest request) {
+        try {
+            CollectionConfig config = collections.getConfig(request.getCollection());
+            if (config == null) {
+                return DeleteDocumentResponse.newBuilder().setFound(false).build();
+            }
+
+            int shardId = collections.routeToShard(request.getDocId(), config.numShards());
+            boolean found;
+            var reader = collections.getReader(request.getCollection(), shardId);
+            try {
+                found = new IndexSearcher(reader).count(new TermQuery(new Term("doc_id", request.getDocId()))) > 0;
+            } finally {
+                collections.releaseReader(reader);
+            }
+            // Always issue the delete: a cached directory-backed reader cannot see documents that
+            // are still buffered in the writer, so the count above only decides what "found"
+            // reports. deleteDocuments is idempotent when the term matches nothing.
+            IndexWriter writer = collections.getWriter(request.getCollection(), shardId);
+            writer.deleteDocuments(new Term("doc_id", request.getDocId()));
+            return DeleteDocumentResponse.newBuilder().setFound(found).build();
+        } catch (Exception e) {
+            LOG.errorf(e, "Failed to delete doc %s", request.getDocId());
+            return DeleteDocumentResponse.newBuilder().setFound(false).build();
         }
     }
 

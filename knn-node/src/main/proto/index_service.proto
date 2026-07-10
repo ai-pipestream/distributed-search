@@ -102,6 +102,8 @@ message CreateCollectionRequest {
   // DJL model name for server-side embedding (e.g., "bge_m3").
   // Required if clients will send text without pre-computed vectors.
   string embedding_model = 5;
+  // Internal control-plane marker. Recipients apply the mutation but must not rebroadcast it.
+  bool cluster_propagation = 6;
 }
 
 // Response after creating a collection.
@@ -130,6 +132,8 @@ message ListCollectionsResponse {
 // Request to delete a collection.
 message DeleteCollectionRequest {
   string name = 1;
+  // Internal control-plane marker. Recipients apply the mutation but must not rebroadcast it.
+  bool cluster_propagation = 2;
 }
 
 // Response after deleting a collection.

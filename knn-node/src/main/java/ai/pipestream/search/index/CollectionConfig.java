@@ -13,8 +13,9 @@ public record CollectionConfig(
         String embeddingModel
 ) {
     public CollectionConfig {
-        if (name == null || name.isBlank()) {
-            throw new IllegalArgumentException("Collection name must not be blank");
+        if (name == null || !name.matches("[a-z0-9][a-z0-9-]{0,62}")) {
+            throw new IllegalArgumentException(
+                    "Collection name must match [a-z0-9][a-z0-9-]{0,62}");
         }
         if (vectorDimension <= 0) {
             throw new IllegalArgumentException("Vector dimension must be positive");
