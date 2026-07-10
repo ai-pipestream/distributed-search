@@ -2,6 +2,7 @@
 # Build N shards from a single docs.vec (see poc/2-indexer for full dataset pipeline).
 # Usage: ./build-shards.sh <path_to_docs.vec> [dim] [num_shards] [chunk_file]
 # Default: dim=1024, num_shards=8. Output: ./shards-8-new/
+# OUT_SUFFIX (default: new). Use OUT_SUFFIX=stock only if baseline Lucene cannot read fork-built indexes.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,7 +10,8 @@ VEC_PATH="${1:?Usage: ./build-shards.sh <path_to_docs.vec> [dim] [num_shards] [c
 DIM="${2:-1024}"
 SHARDS="${3:-8}"
 CHUNK_FILE="${4:-}"
-OUT_DIR="./shards-$SHARDS-new"
+OUT_SUFFIX="${OUT_SUFFIX:-new}"
+OUT_DIR="./shards-$SHARDS-$OUT_SUFFIX"
 
 mkdir -p "$OUT_DIR"
 

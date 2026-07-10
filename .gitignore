@@ -19,7 +19,8 @@ cluster-config.json
 
 # Index data (too large for git)
 shards-*/
-index/
+/index/
+data/
 
 # OS
 .DS_Store

@@ -21,7 +21,22 @@ dependencies {
     implementation 'io.quarkus:quarkus-arc'
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-smallrye-health'
-    implementation files('/work/opensearch-grpc-knn/lucene/lucene/core/build/libs/lucene-core-11.0.0-SNAPSHOT.jar')
+    implementation 'io.quarkus:quarkus-scheduler'
+    // Compile against both Lucene core and sandbox. The shared-floor API intentionally lives in
+    // sandbox; depending on a forked core class would make the distributed engine unreleasable.
+    // Override these paths with -PluceneCoreJarDir and -PluceneSandboxJarDir in other workspaces.
+    def luceneJar = project.findProperty('luceneJar')
+    def luceneCoreJarDir = project.findProperty('luceneCoreJarDir')
+            ?: project.findProperty('luceneJarDir')
+            ?: '/work/worktrees/lucene-cross-shard-optimistic/lucene/core/build/libs'
+    def luceneSandboxJarDir = project.findProperty('luceneSandboxJarDir')
+            ?: '/work/worktrees/lucene-cross-shard-optimistic/lucene/sandbox/build/libs'
+    if (luceneJar != null) {
+        implementation files(luceneJar)
+    } else {
+        implementation fileTree(dir: luceneCoreJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
+        implementation fileTree(dir: luceneSandboxJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
+    }
     testImplementation 'io.quarkus:quarkus-junit'
     testImplementation 'io.rest-assured:rest-assured'
 }
@@ -41,4 +56,18 @@ compileJava {
 
 compileTestJava {
     options.encoding = 'UTF-8'
+}
+
+// Lucene needs vector API and native access for optimal HNSW performance
+def luceneJvmArgs = [
+    '--add-modules', 'jdk.incubator.vector',
+    '--enable-native-access=ALL-UNNAMED'
+]
+
+test {
+    jvmArgs luceneJvmArgs
+}
+
+quarkusDev {
+    jvmArgs = luceneJvmArgs
 }

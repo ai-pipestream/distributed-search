@@ -17,7 +17,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import ai.pipestream.search.discovery.ScaleCubeClusterBootstrap;
 import ai.pipestream.search.grpc.*;
-import org.apache.lucene.search.CollaborativeKnnCollector;
+import org.apache.lucene.sandbox.search.knn.GlobalKnnFloor;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
@@ -27,10 +27,11 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.LongAccumulator;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Path("/search")
@@ -62,13 +63,38 @@ public class KnnResource {
     GrpcChannelCache channelCache;
 
     @GET
+    @Path("/smoke")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Uni<SearchResult> smokeSearch(
+            @QueryParam("k") @DefaultValue("10") int k,
+            @QueryParam("collaborative") @DefaultValue("true") boolean collaborative,
+            @QueryParam("collection") @DefaultValue("") String collection) {
+        final int topK = k < 1 ? 10 : k;
+        // Generate a deterministic random query vector matching the index dimension
+        Random r = new Random(12345);
+        List<Float> vector = new ArrayList<>(128);
+        float norm = 0;
+        float[] raw = new float[128];
+        for (int i = 0; i < 128; i++) {
+            raw[i] = r.nextFloat();
+            norm += raw[i] * raw[i];
+        }
+        norm = (float) Math.sqrt(norm);
+        for (int i = 0; i < 128; i++) {
+            vector.add(raw[i] / norm);
+        }
+        return leaderSearch(topK, vector, collaborative, -1, -1, collection);
+    }
+
+    @GET
     @Path("/text")
     public Uni<SearchResult> textSearch(
             @QueryParam("q") String text,
             @QueryParam("k") @DefaultValue("10") int k,
             @QueryParam("collaborative") @DefaultValue("true") boolean collaborative,
             @QueryParam("maxPeers") @DefaultValue("-1") int maxPeers,
-            @QueryParam("perShardK") @DefaultValue("-1") int perShardK) {
+            @QueryParam("perShardK") @DefaultValue("-1") int perShardK,
+            @QueryParam("collection") @DefaultValue("") String collection) {
         final int topK = k < 1 ? 10 : k;
         String formattedQuery = queryPrefix + text;
         return djlService.getEmbeddingsRaw(List.of(formattedQuery))
@@ -77,7 +103,7 @@ public class KnnResource {
                     if (embeddings.isEmpty()) {
                         return Uni.createFrom().failure(new IllegalStateException("No embeddings from DJL"));
                     }
-                    return leaderSearch(topK, embeddings.get(0), collaborative, maxPeers, perShardK);
+                    return leaderSearch(topK, embeddings.get(0), collaborative, maxPeers, perShardK, collection);
                 });
     }
 
@@ -88,7 +114,8 @@ public class KnnResource {
             @QueryParam("q") String text,
             @QueryParam("k") @DefaultValue("100") int k,
             @QueryParam("maxPeers") @DefaultValue("-1") int maxPeers,
-            @QueryParam("perShardK") @DefaultValue("-1") int perShardK) {
+            @QueryParam("perShardK") @DefaultValue("-1") int perShardK,
+            @QueryParam("collection") @DefaultValue("") String collection) {
         final int topK = k < 1 ? 100 : k;
         String formattedQuery = queryPrefix + text;
         LOG.infof("Comparison search: [%s] k=%d", formattedQuery, topK);
@@ -100,8 +127,8 @@ public class KnnResource {
                         return Uni.createFrom().failure(new IllegalStateException("No embeddings from DJL"));
                     }
                     List<Float> vector = embeddings.get(0);
-                    return leaderSearch(topK, vector, false, maxPeers, perShardK)
-                            .onItem().transformToUni(stdResult -> leaderSearch(topK, vector, true, maxPeers, perShardK)
+                    return leaderSearch(topK, vector, false, maxPeers, perShardK, collection)
+                            .onItem().transformToUni(stdResult -> leaderSearch(topK, vector, true, maxPeers, perShardK, collection)
                                     .onItem().transform(collabResult ->
                                             buildComparison(stdResult, collabResult, topK)));
                 });
@@ -113,23 +140,34 @@ public class KnnResource {
             List<Float> vector,
             @QueryParam("collaborative") @DefaultValue("true") boolean collaborative,
             @QueryParam("maxPeers") @DefaultValue("-1") int maxPeers,
-            @QueryParam("perShardK") @DefaultValue("-1") int perShardK) {
-        
+            @QueryParam("perShardK") @DefaultValue("-1") int perShardK,
+            @QueryParam("collection") @DefaultValue("") String collection) {
+
+        if (k <= 0) {
+            return Uni.createFrom().failure(new IllegalArgumentException("k must be positive"));
+        }
+        if (perShardK > 0 && perShardK < k) {
+            return Uni.createFrom().failure(new IllegalArgumentException("perShardK must be at least k"));
+        }
         String queryId = UUID.randomUUID().toString();
         int shardK = perShardK > 0 ? perShardK : k;
-        LOG.infof("Leader: Starting Search %s (K=%d, collab=%b)", queryId, k, collaborative);
+        LOG.infof("Leader: Starting Search %s (K=%d, collab=%b, collection=%s)", queryId, k, collaborative, collection);
 
-        SearchRequest request = SearchRequest.newBuilder()
+        SearchRequest.Builder reqBuilder = SearchRequest.newBuilder()
                 .setQueryId(queryId)
                 .addAllVector(vector)
                 .setK(shardK)
-                .setCollaborative(collaborative)
-                .build();
+                .setCollaborative(collaborative);
+        if (collection != null && !collection.isEmpty()) {
+            reqBuilder.setCollection(collection);
+        }
+        SearchRequest request = reqBuilder.build();
 
-        // RELAY ARCHITECTURE: No leader-side heap during search - avoid synchronized bottleneck.
-        // Track best scores for floor broadcast; build Top-K only at end from collected hits.
-        LongAccumulator globalBestAcc = collaborative
-                ? new LongAccumulator(Long::max, Long.MIN_VALUE) : null;
+        // The leader owns a per-query floor over distinct emitted document IDs. Every broadcast is
+        // monotonic and represents a lower bound on the final merged cutoff, never a shard-local
+        // best score.
+        GlobalKnnFloor coordinatorFloor = collaborative ? new GlobalKnnFloor(shardK) : null;
+        Set<Long> floorDocumentIds = collaborative ? ConcurrentHashMap.newKeySet() : null;
         BroadcastProcessor<CoordinateRequest> coordinatorBroadcaster = BroadcastProcessor.create();
         List<KnnNodeService.SearchHit> resultHits = new ArrayList<>();
 
@@ -137,10 +175,11 @@ public class KnnResource {
 
         // 1. Local shard
         allStreams.add(localService.search(request)
-                .onItem().invoke(hit -> {
-                    if (hit.getGlobalId() < Long.MAX_VALUE - 100 && hit.getGlobalId() != 0) {
-                        synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(hit.getGlobalId(), hit.getScore(), hit.getChunk())); }
-                        if (collaborative) relayCoordination(queryId, hit.getScore(), globalBestAcc, coordinatorBroadcaster);
+                .onItem().invoke(msg -> {
+                    if (msg.getPayloadCase() == SearchResponse.PayloadCase.HIT) {
+                        SearchHit h = msg.getHit();
+                        synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(h.getGlobalId(), h.getScore(), h.getChunk())); }
+                        if (collaborative) relayHit(queryId, h, coordinatorFloor, floorDocumentIds, coordinatorBroadcaster);
                     }
                 }));
 
@@ -150,26 +189,51 @@ public class KnnResource {
                     .onItem().transformToUni(instances -> {
                         List<ServiceInstance> selectedPeers = selectPeers(instances, maxPeers);
                         for (ServiceInstance si : selectedPeers) {
-                            allStreams.add(callPeerStreaming(si.getHost(), si.getPort(), request, resultHits, globalBestAcc, coordinatorBroadcaster));
+                            allStreams.add(callPeerStreaming(si.getHost(), si.getPort(), request, resultHits, coordinatorFloor, floorDocumentIds, coordinatorBroadcaster));
                         }
-                        return aggregateFirehoses(allStreams, resultHits, k, queryId, globalBestAcc != null);
+                        return aggregateFirehoses(allStreams, resultHits, k, queryId, coordinatorFloor != null)
+                                .eventually(coordinatorBroadcaster::onComplete);
                     });
         }
 
-        return aggregateFirehoses(allStreams, resultHits, k, queryId, globalBestAcc != null);
+        return aggregateFirehoses(allStreams, resultHits, k, queryId, coordinatorFloor != null)
+                .eventually(coordinatorBroadcaster::onComplete);
     }
 
-    /** Relay: when a better score is seen, broadcast to all shards. No heap - lightweight. */
-    private void relayCoordination(String qid, float score, LongAccumulator bestAcc,
-                                  BroadcastProcessor<CoordinateRequest> broadcaster) {
-        if (bestAcc == null) return;
-        long encoded = CollaborativeKnnCollector.encode(Integer.MAX_VALUE, score);
-        long old = bestAcc.get();
-        bestAcc.accumulate(encoded);
-        if (bestAcc.get() > old) {
+    /** Offer a distinct shard hit to the coordinator and broadcast only a raised cutoff. */
+    private void relayHit(
+            String qid,
+            SearchHit hit,
+            GlobalKnnFloor floor,
+            Set<Long> seenDocumentIds,
+            BroadcastProcessor<CoordinateRequest> broadcaster) {
+        if (floor == null || seenDocumentIds.add(hit.getGlobalId()) == false) return;
+        float oldFloor = floor.floor();
+        floor.offer(new float[] {hit.getScore()}, 1);
+        broadcastRaisedFloor(qid, oldFloor, floor.floor(), broadcaster);
+    }
+
+    /** Incorporate a shard-advertised lower bound and relay it only if it raises the coordinator. */
+    private void relayAdvertisedFloor(
+            String qid,
+            float score,
+            GlobalKnnFloor floor,
+            BroadcastProcessor<CoordinateRequest> broadcaster) {
+        if (floor == null || !Float.isFinite(score)) return;
+        float oldFloor = floor.floor();
+        floor.advertise(score);
+        broadcastRaisedFloor(qid, oldFloor, floor.floor(), broadcaster);
+    }
+
+    private void broadcastRaisedFloor(
+            String qid,
+            float oldFloor,
+            float newFloor,
+            BroadcastProcessor<CoordinateRequest> broadcaster) {
+        if (newFloor > oldFloor) {
             broadcaster.onNext(CoordinateRequest.newBuilder()
                     .setQueryId(qid)
-                    .setMinScore(score)
+                    .setMinScore(newFloor)
                     .build());
         }
     }
@@ -177,7 +241,8 @@ public class KnnResource {
     private Multi<SearchResponse> callPeerStreaming(
             String host, int port, SearchRequest request,
             List<KnnNodeService.SearchHit> resultHits,
-            LongAccumulator bestAcc,
+            GlobalKnnFloor coordinatorFloor,
+            Set<Long> floorDocumentIds,
             BroadcastProcessor<CoordinateRequest> broadcaster) {
 
         MutinyKnnNodeServiceGrpc.MutinyKnnNodeServiceStub peer = MutinyKnnNodeServiceGrpc.newMutinyStub(
@@ -187,14 +252,15 @@ public class KnnResource {
 
         peer.coordinate(outboundCoordination)
                 .subscribe().with(resp -> {
-                    if (bestAcc != null) relayCoordination(request.getQueryId(), resp.getMinScore(), bestAcc, broadcaster);
+                    relayAdvertisedFloor(request.getQueryId(), resp.getMinScore(), coordinatorFloor, broadcaster);
                 }, err -> {});
 
         return peer.search(request)
-                .onItem().invoke(hit -> {
-                    if (hit.getGlobalId() < Long.MAX_VALUE - 100 && hit.getGlobalId() != 0) {
-                        synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(hit.getGlobalId(), hit.getScore(), hit.getChunk())); }
-                        if (bestAcc != null) relayCoordination(request.getQueryId(), hit.getScore(), bestAcc, broadcaster);
+                .onItem().invoke(msg -> {
+                    if (msg.getPayloadCase() == SearchResponse.PayloadCase.HIT) {
+                        SearchHit h = msg.getHit();
+                        synchronized (resultHits) { resultHits.add(new KnnNodeService.SearchHit(h.getGlobalId(), h.getScore(), h.getChunk())); }
+                        relayHit(request.getQueryId(), h, coordinatorFloor, floorDocumentIds, broadcaster);
                     }
                 });
     }
@@ -207,9 +273,9 @@ public class KnnResource {
         AtomicInteger finishedShards = new AtomicInteger(0);
 
         return Multi.createBy().merging().streams(streams)
-                .onItem().invoke(hit -> {
-                    if (hit.getGlobalId() > Long.MAX_VALUE - 100) {
-                        totalVisited.addAndGet(hit.getNodesVisited());
+                .onItem().invoke(msg -> {
+                    if (msg.getPayloadCase() == SearchResponse.PayloadCase.DEBUG) {
+                        totalVisited.addAndGet(msg.getDebug().getNodesVisited());
                         finishedShards.incrementAndGet();
                     }
                 })

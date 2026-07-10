@@ -1,5 +1,6 @@
 package ai.pipestream.search.node;
 
+import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.runtime.StartupEvent;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.mutiny.Multi;
@@ -8,33 +9,38 @@ import io.smallrye.mutiny.subscription.MultiEmitter;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Singleton;
 import ai.pipestream.search.grpc.*;
+import ai.pipestream.search.index.CollectionManager;
+import jakarta.inject.Inject;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.StoredFields;
-import org.apache.lucene.search.CollaborativeKnnCollector;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.search.knn.CollaborativeKnnCollectorManager;
 import org.apache.lucene.search.knn.KnnCollectorManager;
 import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.search.knn.TopKnnCollectorManager;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.sandbox.search.knn.FloorAwareKnnCollector;
+import org.apache.lucene.sandbox.search.knn.GlobalKnnFloor;
+import org.apache.lucene.sandbox.search.knn.SharedFloorKnnCollectorManager;
 import org.eclipse.microprofile.config.ConfigProvider;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.atomic.LongAccumulator;
 
 @Singleton
 @GrpcService
@@ -42,10 +48,47 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
 
     private static final Logger LOG = Logger.getLogger(KnnNodeService.class);
 
-    private final Map<String, LongAccumulator> localSearches = new ConcurrentHashMap<>();
+    /** Vector field name used by engine-built (collection/legacy) indices. */
+    private static final String ENGINE_VECTOR_FIELD = "vector";
+    /** Stored id field written by luceneutil KnnIndexer (KnnGraphTester.ID_FIELD). */
+    private static final String EXTERNAL_ID_FIELD = "id";
+
+    @Inject
+    CollectionManager collectionManager;
+
+    /**
+     * Pure mode: the search path uses exactly the caller's k — no internal K-scaling,
+     * no visit limit, no topology sketches. Only the collaborative global-floor
+     * propagation remains, and stays toggleable per request. For fair A/B benchmarks.
+     */
+    @ConfigProperty(name = "knn.pure-mode", defaultValue = "false")
+    boolean pureMode;
+
+    /**
+     * Pre-built external Lucene index (e.g. from luceneutil KnnGraphTester).
+     * When set, all searches run against this read-only index instead of
+     * engine-built collection shards or the legacy index path.
+     */
+    @ConfigProperty(name = "knn.external-index-path")
+    Optional<String> externalIndexPath;
+
+    @ConfigProperty(name = "knn.external-index-vector-field", defaultValue = "knn")
+    String externalIndexVectorField;
+
+    /** Cached read-only reader for the external index. Closed on shutdown. */
+    private volatile DirectoryReader externalReader;
+
+    private final Map<String, GlobalKnnFloor> localSearches = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> searchVisits = new ConcurrentHashMap<>();
     private final Map<String, AtomicReference<byte[]>> searchHints = new ConcurrentHashMap<>();
     private volatile int indexVectorDimension = -1;
+
+    @ConfigProperty(name = "knn.shared-floor.global-share", defaultValue = "1.0")
+    float sharedFloorGlobalShare;
+
+    /** Disabled until the coordinator consumes neighborhood hints in a pruning decision. */
+    @ConfigProperty(name = "knn.topology-sketch.enabled", defaultValue = "false")
+    boolean topologySketchEnabled;
 
     public static class SearchHit {
         public long globalId;
@@ -67,16 +110,26 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
         private final AtomicLong visitCounter;
         private final AtomicReference<byte[]> hintRef;
         private final int originalK;
+        private final String vectorField;
+        private final String idField;       // null → synthesize (shardId << 32) | docId
+        private final boolean sketchEnabled;
+        private final int docBase;          // collect() receives leaf-local doc ids
+        private final Set<Integer> emittedDocs; // query-scoped, reader-global doc ids
         private int emittedCount = 0;
 
-        public StreamingKnnCollector(KnnCollector delegate, 
-                                   MultiEmitter<? super SearchResponse> emitter, 
-                                   int shardId, 
+        public StreamingKnnCollector(KnnCollector delegate,
+                                   MultiEmitter<? super SearchResponse> emitter,
+                                   int shardId,
                                    StoredFields storedFields,
                                    List<LeafReaderContext> leaves,
                                    AtomicLong visitCounter,
                                    AtomicReference<byte[]> hintRef,
-                                   int originalK) {
+                                   int originalK,
+                                   String vectorField,
+                                   String idField,
+                                   boolean sketchEnabled,
+                                   int docBase,
+                                   Set<Integer> emittedDocs) {
             super(delegate);
             this.emitter = emitter;
             this.shardId = shardId;
@@ -85,6 +138,11 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
             this.visitCounter = visitCounter;
             this.hintRef = hintRef;
             this.originalK = originalK;
+            this.vectorField = vectorField;
+            this.idField = idField;
+            this.sketchEnabled = sketchEnabled;
+            this.docBase = docBase;
+            this.emittedDocs = emittedDocs;
         }
 
         @Override
@@ -98,20 +156,16 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
             boolean collected = super.collect(docId, similarity);
             if (collected) {
                 try {
-                    float[] vec = getVector(leaves, docId);
-                    if (vec != null) {
-                        hintRef.set(TopologySketchUtil.computeBinarySignature(vec));
+                    int globalDoc = docBase + docId;
+                    if (sketchEnabled) {
+                        float[] vec = getVector(leaves, vectorField, globalDoc);
+                        if (vec != null) {
+                            hintRef.set(TopologySketchUtil.computeBinarySignature(vec));
+                        }
                     }
 
-                    if (emittedCount < originalK) {
-                        SearchResponse.Builder hitBuilder = SearchResponse.newBuilder()
-                                .setGlobalId(((long) shardId << 32) | docId)
-                                .setScore(similarity);
-                        
-                        String chunk = getChunk(storedFields, docId);
-                        if (chunk != null) hitBuilder.setChunk(chunk);
-                        
-                        emitter.emit(hitBuilder.build());
+                    if (emittedCount < originalK && emittedDocs.add(globalDoc)) {
+                        emitHit(emitter, storedFields, shardId, globalDoc, similarity, idField);
                         emittedCount++;
                     }
                 } catch (Exception e) {
@@ -122,50 +176,175 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
         }
     }
 
+    private static void emitHit(MultiEmitter<? super SearchResponse> emitter,
+                                StoredFields storedFields,
+                                int shardId, int globalDoc, float score,
+                                String idField) throws IOException {
+        var doc = storedFields.document(globalDoc);
+        long globalId = ((long) shardId << 32) | globalDoc;
+        if (idField != null) {
+            var stored = doc.getField(idField);
+            if (stored != null && stored.numericValue() != null) {
+                globalId = stored.numericValue().longValue();
+            }
+        }
+        ai.pipestream.search.grpc.SearchHit.Builder hitBuilder = ai.pipestream.search.grpc.SearchHit.newBuilder()
+                .setGlobalId(globalId)
+                .setScore(score);
+        var chunkField = doc.getField("chunk");
+        if (chunkField != null) hitBuilder.setChunk(chunkField.stringValue());
+        emitter.emit(SearchResponse.newBuilder().setHit(hitBuilder.build()).build());
+    }
+
     void onStart(@Observes StartupEvent ev) {
         String path = resolveIndexPath();
         int shardId = resolveShardId();
         LOG.infof("=== KNN Node Starting (Shard: %d) ===", shardId);
+        if (pureMode) {
+            LOG.info("PURE MODE enabled: no K-scaling, no visit limit, no topology sketches. Only the collaborative floor (when requested) applies.");
+        }
+        if (externalIndexPath.isPresent()) {
+            try {
+                DirectoryReader reader = externalReader();
+                indexVectorDimension = resolveIndexVectorDimension(reader, externalIndexVectorField);
+                LOG.infof("SUCCESS: External index loaded from %s. Contains %d documents, field='%s', dim=%d.",
+                        externalIndexPath.get(), reader.numDocs(), externalIndexVectorField, indexVectorDimension);
+            } catch (Exception e) {
+                LOG.errorf(e, "Failed to open external index at %s", externalIndexPath.get());
+            }
+            return;
+        }
+        if ("NONE".equals(path)) {
+            LOG.info("No legacy index path configured. Collections-only mode.");
+            return;
+        }
         try (DirectoryReader reader = DirectoryReader.open(FSDirectory.open(Path.of(path)))) {
-            indexVectorDimension = resolveIndexVectorDimension(reader);
+            indexVectorDimension = resolveIndexVectorDimension(reader, ENGINE_VECTOR_FIELD);
             LOG.infof("SUCCESS: Index loaded. Contains %d documents, dim=%d.", reader.numDocs(), indexVectorDimension);
         } catch (Exception e) {
-            LOG.errorf("CRITICAL: Failed to load index at %s: %s", path, e.getMessage());
+            LOG.warnf("No legacy index at %s: %s (this is OK if using collections)", path, e.getMessage());
         }
+    }
+
+    void onShutdown(@Observes ShutdownEvent ev) {
+        DirectoryReader reader = externalReader;
+        if (reader != null) {
+            try { reader.close(); } catch (IOException ignored) {}
+        }
+    }
+
+    /** Lazily opens (and caches) the read-only reader for the external index. */
+    private DirectoryReader externalReader() throws IOException {
+        DirectoryReader reader = externalReader;
+        if (reader == null) {
+            synchronized (this) {
+                reader = externalReader;
+                if (reader == null) {
+                    reader = DirectoryReader.open(FSDirectory.open(Path.of(externalIndexPath.orElseThrow())));
+                    externalReader = reader;
+                }
+            }
+        }
+        return reader;
     }
 
     @Override
     public Multi<SearchResponse> search(SearchRequest request) {
         return Multi.createFrom().<SearchResponse>emitter(emitter -> {
             String qid = request.getQueryId();
+            if (request.getK() <= 0) {
+                emitter.fail(new IllegalArgumentException("k must be positive"));
+                return;
+            }
+            if (request.getVectorCount() == 0) {
+                emitter.fail(new IllegalArgumentException("query vector must not be empty"));
+                return;
+            }
+            if (!pureMode && request.getK() > Integer.MAX_VALUE / 5) {
+                emitter.fail(new IllegalArgumentException("k is too large"));
+                return;
+            }
             String path = resolveIndexPath();
             int shardId = resolveShardId();
             long startTime = System.currentTimeMillis();
             
-            int internalK = request.getK() * 5;
-            int visitLimit = internalK * 10; 
+            boolean externalIndex = externalIndexPath.isPresent();
+            String vectorField = externalIndex ? externalIndexVectorField : ENGINE_VECTOR_FIELD;
 
-            LOG.infof("[DIAGNOSTIC] Shard %d starting search for %s (K=%d, internalK=%d, visitLimit=%d)", 
-                shardId, qid, request.getK(), internalK, visitLimit);
+            // A shared floor and the coordinator must use the same k. Oversampling remains
+            // available for ordinary searches, but collaborative searches use the request k until
+            // the coordinator also exchanges bounded score batches for an oversampled candidate set.
+            int internalK = (pureMode || request.getCollaborative()) ? request.getK() : request.getK() * 5;
+            int visitLimit = pureMode ? Integer.MAX_VALUE : internalK * 10;
 
-            LongAccumulator acc = new LongAccumulator(Long::max, Long.MIN_VALUE);
+            LOG.infof("[DIAGNOSTIC] Shard %d starting search for %s (K=%d, internalK=%d, visitLimit=%d, pure=%b, external=%b)",
+                shardId, qid, request.getK(), internalK, visitLimit, pureMode, externalIndex);
+
+            GlobalKnnFloor sharedFloor = request.getCollaborative() ? new GlobalKnnFloor(internalK) : null;
             AtomicLong visits = new AtomicLong(0);
             AtomicReference<byte[]> hint = new AtomicReference<>(null);
             
             if (request.getCollaborative()) {
-                localSearches.put(qid, acc);
+                localSearches.put(qid, sharedFloor);
                 searchVisits.put(qid, visits);
                 searchHints.put(qid, hint);
             }
 
-            try (DirectoryReader reader = DirectoryReader.open(FSDirectory.open(Path.of(path)))) {
-                IndexSearcher searcher = new IndexSearcher(reader);
+            DirectoryReader reader = null;
+            boolean ownsReader = false;
+            boolean acquiredCollectionReader = false;
+            try {
+                // Open reader: external index if configured, else from CollectionManager
+                // if collection specified, else legacy path
+                String collectionName = request.getCollection();
+                if (externalIndex) {
+                    reader = externalReader();
+                    ownsReader = false; // cached, closed on shutdown
+                } else if (!collectionName.isEmpty()) {
+                    reader = collectionManager.getReader(collectionName, shardId);
+                    acquiredCollectionReader = true;
+                } else {
+                    reader = DirectoryReader.open(FSDirectory.open(Path.of(path)));
+                    ownsReader = true;
+                }
+                final DirectoryReader theReader = reader;
+                IndexSearcher searcher = new IndexSearcher(theReader);
                 float[] vector = new float[request.getVectorCount()];
-                for (int i = 0; i < request.getVectorCount(); i++) vector[i] = request.getVector(i);
+                for (int i = 0; i < request.getVectorCount(); i++) {
+                    float value = request.getVector(i);
+                    if (Float.isFinite(value) == false) {
+                        throw new IllegalArgumentException("query vector must contain only finite values");
+                    }
+                    vector[i] = value;
+                }
+                int expectedDimension = indexVectorDimension;
+                if (!collectionName.isEmpty()) {
+                    var config = collectionManager.getConfig(collectionName);
+                    if (config == null) {
+                        throw new IllegalArgumentException("Collection not found: " + collectionName);
+                    }
+                    expectedDimension = config.vectorDimension();
+                }
+                if (expectedDimension > 0 && vector.length != expectedDimension) {
+                    throw new IllegalArgumentException(
+                            "query vector dimension mismatch: expected " + expectedDimension + ", got " + vector.length);
+                }
+
+                final String idField = externalIndex ? EXTERNAL_ID_FIELD : null;
+                // Reader-global doc ids already emitted for this query, shared across
+                // leaves and consulted by the drain phase below.
+                final Set<Integer> emittedDocs = ConcurrentHashMap.newKeySet();
 
                 KnnCollectorManager manager;
                 if (request.getCollaborative()) {
-                    manager = new CollaborativeKnnCollectorManager(internalK, acc, hint);
+                    manager = new SharedFloorKnnCollectorManager(
+                            internalK,
+                            sharedFloor,
+                            FloorAwareKnnCollector.DEFAULT_GREEDINESS,
+                            SharedFloorKnnCollectorManager.DEFAULT_FLOOR_ACTIVATION_K,
+                            FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS,
+                            FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL,
+                            sharedFloorGlobalShare);
                 } else {
                     manager = new TopKnnCollectorManager(internalK, searcher);
                 }
@@ -173,12 +352,30 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 KnnCollectorManager streamingManager = new KnnCollectorManager() {
                     @Override
                     public KnnCollector newCollector(int ignored, KnnSearchStrategy strategy, LeafReaderContext context) throws IOException {
-                        return new StreamingKnnCollector(manager.newCollector(visitLimit, strategy, context), 
-                                                       emitter, shardId, reader.storedFields(), reader.leaves(), visits, hint, request.getK());
+                        return new StreamingKnnCollector(manager.newCollector(visitLimit, strategy, context),
+                                                       emitter, shardId, theReader.storedFields(), theReader.leaves(), visits, hint, request.getK(),
+                                                       vectorField, idField, topologySketchEnabled, context.docBase, emittedDocs);
+                    }
+
+                    @Override
+                    public KnnCollector newOptimisticCollector(
+                            int ignored,
+                            KnnSearchStrategy strategy,
+                            LeafReaderContext context,
+                            int perLeafK) throws IOException {
+                        return new StreamingKnnCollector(
+                                manager.newOptimisticCollector(visitLimit, strategy, context, perLeafK),
+                                emitter, shardId, theReader.storedFields(), theReader.leaves(), visits, hint,
+                                request.getK(), vectorField, idField, topologySketchEnabled, context.docBase, emittedDocs);
+                    }
+
+                    @Override
+                    public boolean isOptimistic() {
+                        return manager.isOptimistic();
                     }
                 };
 
-                KnnFloatVectorQuery query = new KnnFloatVectorQuery("vector", vector, internalK) {
+                KnnFloatVectorQuery query = new KnnFloatVectorQuery(vectorField, vector, internalK) {
                     @Override
                     protected KnnCollectorManager getKnnCollectorManager(int k, IndexSearcher searcher) {
                         return streamingManager;
@@ -186,14 +383,29 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 };
 
                 TopDocs td = searcher.search(query, internalK);
-                
-                LOG.infof("[DIAGNOSTIC] Shard %d search %s finished. Lucene reported %d hits, visits=%d", 
-                    shardId, qid, td.scoreDocs.length, visits.get());
+
+                // Drain phase: streaming emits candidates as they are ACCEPTED into the
+                // heap, so late entries into the final top-k may not have been emitted.
+                // Emit whatever of the final top-k is still missing (TopDocs doc ids are
+                // reader-global) so the shard's final top-k always reaches the leader.
+                int drained = 0;
+                StoredFields drainStoredFields = theReader.storedFields();
+                for (int i = 0; i < td.scoreDocs.length && i < request.getK(); i++) {
+                    ScoreDoc sd = td.scoreDocs[i];
+                    if (emittedDocs.add(sd.doc)) {
+                        emitHit(emitter, drainStoredFields, shardId, sd.doc, sd.score, idField);
+                        drained++;
+                    }
+                }
+
+                LOG.infof("[DIAGNOSTIC] Shard %d search %s finished. Lucene reported %d hits, drained %d late hits, visits=%d",
+                    shardId, qid, td.scoreDocs.length, drained, visits.get());
 
                 emitter.emit(SearchResponse.newBuilder()
-                        .setGlobalId(Long.MAX_VALUE - shardId)
-                        .setNodesVisited(visits.get())
-                        .setSearchTimeMs(System.currentTimeMillis() - startTime)
+                        .setDebug(SearchDebug.newBuilder()
+                                .setNodesVisited(visits.get())
+                                .setSearchTimeMs(System.currentTimeMillis() - startTime)
+                                .build())
                         .build());
                 
                 emitter.complete();
@@ -201,6 +413,16 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 LOG.errorf(e, "Search failed for query %s", qid);
                 emitter.fail(e);
             } finally {
+                if (ownsReader) {
+                    try { reader.close(); } catch (IOException ignored) {}
+                }
+                if (acquiredCollectionReader && reader != null) {
+                    try {
+                        collectionManager.releaseReader(reader);
+                    } catch (IOException e) {
+                        LOG.warnf(e, "Failed to release collection reader for query %s", qid);
+                    }
+                }
                 if (emitter.isCancelled()) {
                     LOG.warnf("[DIAGNOSTIC] Query %s was CANCELLED by gRPC before completion!", qid);
                 }
@@ -217,14 +439,14 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
     public Multi<CoordinateResponse> coordinate(Multi<CoordinateRequest> updatesFromLeader) {
         return updatesFromLeader.onItem().transform(update -> {
             String qid = update.getQueryId();
-            LongAccumulator acc = localSearches.get(qid);
+            GlobalKnnFloor floorState = localSearches.get(qid);
             AtomicLong visits = searchVisits.get(qid);
             AtomicReference<byte[]> hintRef = searchHints.get(qid);
             
-            if (acc != null && Float.isFinite(update.getMinScore()) && update.getMinScore() > Float.NEGATIVE_INFINITY) {
-                float oldVal = CollaborativeKnnCollector.toScore(acc.get());
-                acc.accumulate(CollaborativeKnnCollector.encode(Integer.MAX_VALUE, update.getMinScore()));
-                float newVal = CollaborativeKnnCollector.toScore(acc.get());
+            if (floorState != null && Float.isFinite(update.getMinScore()) && update.getMinScore() > Float.NEGATIVE_INFINITY) {
+                float oldVal = floorState.floor();
+                floorState.advertise(update.getMinScore());
+                float newVal = floorState.floor();
                 if (newVal > oldVal) {
                     LOG.infof("[DIAGNOSTIC] Query %s updated local floor to GLOBAL value: %.6f (Visited so far: %d)", 
                         qid, newVal, visits != null ? visits.get() : -1);
@@ -232,11 +454,8 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
             }
             
             float floor = Float.NEGATIVE_INFINITY;
-            if (acc != null) {
-                long current = acc.get();
-                if (current != Long.MIN_VALUE) {
-                    floor = CollaborativeKnnCollector.toScore(current);
-                }
+            if (floorState != null) {
+                floor = floorState.floor();
             }
             
             CoordinateResponse.Builder resp = CoordinateResponse.newBuilder()
@@ -259,17 +478,11 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
         return ConfigProvider.getConfig().getOptionalValue("knn.shard.id", Integer.class).orElse(0);
     }
 
-    private static String getChunk(StoredFields storedFields, int docId) throws IOException {
-        var doc = storedFields.document(docId);
-        var field = doc.getField("chunk");
-        return field != null ? field.stringValue() : "";
-    }
-
-    private static float[] getVector(List<LeafReaderContext> leaves, int docId) throws IOException {
+    private static float[] getVector(List<LeafReaderContext> leaves, String field, int docId) throws IOException {
         for (LeafReaderContext ctx : leaves) {
             int maxDoc = ctx.reader().maxDoc();
             if (docId >= ctx.docBase && docId < ctx.docBase + maxDoc) {
-                FloatVectorValues fvv = ctx.reader().getFloatVectorValues("vector");
+                FloatVectorValues fvv = ctx.reader().getFloatVectorValues(field);
                 if (fvv == null) return null;
                 int localDoc = docId - ctx.docBase;
                 for (int ord = 0; ord < fvv.size(); ord++) {
@@ -283,9 +496,9 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
         return null;
     }
 
-    private static int resolveIndexVectorDimension(DirectoryReader reader) throws IOException {
+    private static int resolveIndexVectorDimension(DirectoryReader reader, String field) throws IOException {
         for (LeafReaderContext ctx : reader.leaves()) {
-            FloatVectorValues fvv = ctx.reader().getFloatVectorValues("vector");
+            FloatVectorValues fvv = ctx.reader().getFloatVectorValues(field);
             if (fvv != null && fvv.size() > 0) {
                 return fvv.dimension();
             }
