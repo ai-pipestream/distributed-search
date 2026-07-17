@@ -2,6 +2,7 @@
 build/
 .gradle/
 knn-node/build/
+*.tar.gz
 
 # IDE
 .idea/

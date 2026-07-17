@@ -61,6 +61,7 @@ public class KnnNodeTest {
                     "knn.index.path", tempIndexDir.toAbsolutePath().toString(),
                     "knn.shard.id", "0",
                     "knn.single.node", "true",
+                    "knn.pure-mode", "true",
                     "quarkus.http.test-port", "0"
             );
         }

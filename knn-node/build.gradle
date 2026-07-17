@@ -22,27 +22,36 @@ dependencies {
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-smallrye-health'
     implementation 'io.quarkus:quarkus-scheduler'
-    // Compile against both Lucene core and sandbox. The shared-floor API intentionally lives in
-    // sandbox; depending on a forked core class would make the distributed engine unreleasable.
-    // Override these paths with -PluceneCoreJarDir and -PluceneSandboxJarDir in other workspaces.
+    // The shared-floor API currently lives on the companion Lucene branch, so these artifacts
+    // cannot come from Maven Central yet. Keep the dependency explicit and portable instead of
+    // baking one developer's workspace path into the build.
     def luceneJar = project.findProperty('luceneJar')
     def luceneCoreJarDir = project.findProperty('luceneCoreJarDir')
             ?: project.findProperty('luceneJarDir')
-            ?: '/work/worktrees/lucene-cross-shard-optimistic/lucene/core/build/libs'
+            ?: System.getenv('LUCENE_CORE_JAR_DIR')
     def luceneSandboxJarDir = project.findProperty('luceneSandboxJarDir')
-            ?: '/work/worktrees/lucene-cross-shard-optimistic/lucene/sandbox/build/libs'
+            ?: System.getenv('LUCENE_SANDBOX_JAR_DIR')
     if (luceneJar != null) {
         implementation files(luceneJar)
     } else {
+        if (luceneCoreJarDir == null || luceneSandboxJarDir == null) {
+            throw new GradleException('Lucene artifacts are required. Set luceneCoreJarDir and '
+                    + 'luceneSandboxJarDir as Gradle properties or LUCENE_CORE_JAR_DIR and '
+                    + 'LUCENE_SANDBOX_JAR_DIR as environment variables.')
+        }
         implementation fileTree(dir: luceneCoreJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
         implementation fileTree(dir: luceneSandboxJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
     }
     // Additional Lucene modules for the query compiler: analyzers (english/keyword/...)
     // and the classic QueryParser. Same locally-built tree as lucene-core above;
     // override with -PluceneModuleJarDirs=<dir1>,<dir2>.
-    def luceneModuleJarDirs = project.findProperty('luceneModuleJarDirs')?.split(',')
-            ?: ['/work/worktrees/lucene-cross-shard-optimistic/lucene/analysis/common/build/libs',
-                '/work/worktrees/lucene-cross-shard-optimistic/lucene/queryparser/build/libs']
+    def luceneModuleJarDirsValue = project.findProperty('luceneModuleJarDirs')
+            ?: System.getenv('LUCENE_MODULE_JAR_DIRS')
+    if (luceneModuleJarDirsValue == null) {
+        throw new GradleException('Lucene analysis and queryparser artifacts are required. Set '
+                + 'luceneModuleJarDirs or LUCENE_MODULE_JAR_DIRS to a comma-separated directory list.')
+    }
+    def luceneModuleJarDirs = luceneModuleJarDirsValue.split(',')
     luceneModuleJarDirs.each { moduleDir ->
         implementation fileTree(dir: moduleDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
     }

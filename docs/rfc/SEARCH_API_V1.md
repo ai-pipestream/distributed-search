@@ -62,19 +62,48 @@ type), not a JSON string and not a monolithic request message.
 - `knn` also carries the engine-specific knobs that make this engine what it
   is: `collaborative` (cross-shard floor sharing) and a per-clause
   `visit_budget`, plus `num_candidates` for classic ef_search control.
+  `k` is required and must be > 0 — there is no default k; and
+  `num_candidates`, when set, must be >= `k`. Violations are
+  `INVALID_ARGUMENT`.
 - `hybrid` composes any sub-queries and declares its fusion explicitly:
   `rrf { k }` or `linear { weights }`. Fusion is data, not server config, so
-  two clients can rank the same collection differently.
+  two clients can rank the same collection differently. An unset fusion
+  (`METHOD_NOT_SET`) is treated as RRF with k = 60, the implemented
+  default.
 - **Escape hatch:** `query_string` carries a Lucene classic query string
   parsed server-side. Rationale: migration from existing Lucene/OpenSearch
   tooling and ad-hoc exploration. It is deliberately the *only* stringly
   query node, and it carries the weakest compatibility promise
-  ([§7](#7-versioning-and-compatibility)).
+  ([§7](#7-versioning-and-compatibility)). Bare terms search the query's
+  `default_field`, falling back to `CollectionSchema.default_field`, then
+  to the first TEXT field in schema order.
 - We borrowed field naming from `opensearch-protobufs` where it is good
   (`field`, `value`, `boost`, `filter`, `minimum_should_match`, snake_case
   oneof variants) and rejected its shape: no 30-variant `QueryContainer`,
   no `optional` spam, no `x_name` tagging, no `ObjectMap` grab-bags. Every
   v1 message is small enough to read on one screen.
+
+**Validation contract** (clarified by query-compiler implementation
+feedback — these are properties of the AST, not server quirks):
+
+- **Hybrid placement.** `hybrid` is only valid at the top level of the
+  tree or directly under another `hybrid`. Inside bool clauses, knn
+  pre-filters, or under a `boost`, the server rejects it with
+  `INVALID_ARGUMENT`: fusion merges *rankings*, so a hybrid node cannot
+  compile to a single Lucene query. Likewise `knn` cannot appear inside a
+  knn pre-filter.
+- **`BoolQuery.minimum_should_match`** follows Lucene semantics: with
+  *only* `should` clauses, at least one must match even if the field is
+  explicitly 0 — a pure disjunction cannot match a document that matches
+  none of its clauses.
+- **`MatchQuery.minimum_should_match`** is only honored with
+  `OPERATOR_OR`; combining it with `OPERATOR_AND` is `INVALID_ARGUMENT`
+  (AND already requires every term). The count applies to terms *after*
+  analysis — stopword removal and synonym expansion change the term count.
+- **Unimplemented built-in analyzers** (`WHITESPACE`, `SIMPLE` in
+  v1alpha1) stay in the enum as declared vocabulary; servers reject
+  references to them with a clear `INVALID_ARGUMENT` rather than silently
+  substituting another analyzer.
 
 ### 1.3 Per-query budgets
 
@@ -110,7 +139,13 @@ the legacy `IndexService`. The key change is the schema: instead of
 - `AnalyzerRef` is a `oneof`: a named built-in enum, or a
   `PluggableAnalyzer { name, endpoint, params }` reference resolved by the
   server's analyzer registry. This is the seam for OpenNLP pipelines and
-  remote gRPC analyzers later, without any schema change.
+  remote gRPC analyzers later, without any schema change. The built-in
+  enum names the full v1 vocabulary; servers may implement a subset and
+  must reject unimplemented analyzers with a clear error (in v1alpha1,
+  `WHITESPACE` and `SIMPLE` are declared but unimplemented).
+- `CollectionSchema.default_field` names the TEXT field that
+  `query_string` searches for bare terms when the query sets none; unset,
+  the server falls back to the first TEXT field in schema order.
 - Sharding (`num_shards`) and replication (`ReplicationParams.replicas`)
   are creation-time parameters.
 
@@ -511,7 +546,9 @@ round.
 - Also consciously absent, without needing a design round: server-side
   embedding on the write path (v1 clients send vectors; the legacy
   text-embedding path stays on the legacy proto until an embedding service
-  design exists), scripted scoring, dynamic mapping, and schema mutation.
+  design exists), scripted scoring, dynamic mapping, and schema mutation
+  beyond the wire-safe changes RegisterSchema applies (see the
+  [SCHEMA_AS_PROTO](SCHEMA_AS_PROTO.md) annex).
 
 ---
 

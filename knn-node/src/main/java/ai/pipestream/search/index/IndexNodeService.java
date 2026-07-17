@@ -122,6 +122,9 @@ public class IndexNodeService implements IndexService {
                 return CreateCollectionResponse.newBuilder()
                         .setCollection(toCollectionInfo(config))
                         .build();
+            } catch (IllegalArgumentException e) {
+                LOG.debugf("Rejected collection %s: %s", request.getName(), e.getMessage());
+                throw e;
             } catch (Exception e) {
                 LOG.errorf(e, "Failed to create collection %s", request.getName());
                 throw new RuntimeException(e);

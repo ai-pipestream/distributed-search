@@ -60,6 +60,13 @@ message DocumentField {
 // ---------------------------------------------------------------------------
 
 // The root of the typed query tree. Exactly one variant must be set.
+//
+// Placement rules (violations are INVALID_ARGUMENT):
+//   * `hybrid` is only valid at the top level of the tree or directly as a
+//     sub-query of another `hybrid`. It cannot appear inside bool clauses,
+//     knn pre-filters, or under a `boost` -- fusion merges *rankings*, so a
+//     hybrid node cannot compile to a single Lucene query.
+//   * `knn` cannot appear inside a knn pre-filter (Query.knn.filter).
 message Query {
   oneof kind {
     BoolQuery bool = 1;
@@ -75,6 +82,9 @@ message Query {
   }
 
   // Multiplies the score contribution of this clause. Default 1.0.
+  // Not valid on `hybrid` (INVALID_ARGUMENT): fused rank scores have no
+  // meaningful scalar to multiply -- boost the sub-queries or use linear
+  // fusion weights instead.
   optional float boost = 15;
 }
 
@@ -90,6 +100,9 @@ message BoolQuery {
   repeated Query filter = 4;
   // Number of `should` clauses required to match. Default: 1 if there are
   // no must/filter clauses, otherwise 0.
+  // Lucene semantics apply: when the query has ONLY `should` clauses, at
+  // least one must match even if this is explicitly set to 0 -- a pure
+  // disjunction cannot match a document that matches none of its clauses.
   optional int32 minimum_should_match = 5;
 }
 
@@ -115,7 +128,11 @@ message MatchQuery {
   Operator operator = 3;
   // Analyzer override for the query text; empty = field's search analyzer.
   string analyzer = 4;
-  // Minimum number of analyzed terms that must match (only with OPERATOR_OR).
+  // Minimum number of terms that must match. Only honored with OPERATOR_OR;
+  // combining it with OPERATOR_AND is INVALID_ARGUMENT (AND already requires
+  // every term). The count applies to terms *after* analysis, not to
+  // whitespace-separated words in `text` (stopword removal, synonym
+  // expansion, etc. change the term count).
   optional int32 minimum_should_match = 5;
 }
 
@@ -143,12 +160,15 @@ message KnnQuery {
   string field = 1;
   // Query vector; dimensionality must match the field schema.
   Vector vector = 2;
-  // Number of nearest neighbors this clause contributes.
+  // Number of nearest neighbors this clause contributes. Required: must be
+  // > 0 (there is no default k); 0 or negative is INVALID_ARGUMENT.
   int32 k = 3;
   // First-class pre-filter: graph traversal only visits documents matching
-  // this query. Unset = no filter.
+  // this query. Unset = no filter. Must not contain `knn` or `hybrid`
+  // nodes (INVALID_ARGUMENT).
   Query filter = 4;
-  // Per-shard candidate pool size (ef_search). 0 = server default.
+  // Per-shard candidate pool size (ef_search). 0 = server default; when
+  // set, must be >= k (INVALID_ARGUMENT otherwise).
   int32 num_candidates = 5;
   // Enables cross-shard collaborative traversal: shards share kth-best
   // floors mid-flight so each can prune earlier.
@@ -159,12 +179,20 @@ message KnnQuery {
 }
 
 // Combines several sub-queries and fuses their ranked results.
+//
+// Placement: only valid at the top level of the query tree or directly as
+// a sub-query of another HybridQuery. Anywhere else (bool clauses, knn
+// pre-filters, under a boost) the server rejects the query with
+// INVALID_ARGUMENT -- fusion operates on ranked result lists and cannot
+// compile to a single Lucene query.
 message HybridQuery {
   repeated Query queries = 1;
+  // Unset (METHOD_NOT_SET) is treated as RRF with k = 60.
   Fusion fusion = 2;
 }
 
 // How hybrid sub-query rankings are fused into one ranking.
+// Leaving the oneof unset is allowed: servers apply RRF with k = 60.
 message Fusion {
   oneof method {
     RrfFusion rrf = 1;
@@ -192,7 +220,9 @@ message MatchAllQuery {}
 // provides; prefer the typed AST wherever possible.
 message QueryStringQuery {
   string query = 1;
-  // Field used for bare terms. Empty = collection default field.
+  // Field used for bare terms. Empty = the collection's
+  // CollectionSchema.default_field (which itself falls back to the first
+  // TEXT field in schema order when unset).
   string default_field = 2;
   Operator default_operator = 3;
 }
@@ -374,13 +404,21 @@ enum VectorSimilarity {
   VECTOR_SIMILARITY_MAX_INNER_PRODUCT = 4;
 }
 
-// Server-provided analyzers.
+// Server-provided analyzers. The enum names the full v1 vocabulary, but a
+// server may implement a subset: referencing an analyzer the server has
+// not implemented is rejected with a clear INVALID_ARGUMENT (at schema
+// registration for index-time analyzers, at query time for overrides),
+// never silently substituted. v1alpha1 servers currently implement
+// STANDARD, ENGLISH, and KEYWORD; WHITESPACE and SIMPLE are declared but
+// not yet implemented.
 enum BuiltinAnalyzer {
   BUILTIN_ANALYZER_UNSPECIFIED = 0; // Defaults to STANDARD.
   BUILTIN_ANALYZER_STANDARD = 1;
   BUILTIN_ANALYZER_ENGLISH = 2;
+  // Not implemented in v1alpha1 (see enum comment).
   BUILTIN_ANALYZER_WHITESPACE = 3;
   BUILTIN_ANALYZER_KEYWORD = 4;
+  // Not implemented in v1alpha1 (see enum comment).
   BUILTIN_ANALYZER_SIMPLE = 5;
 }
 
@@ -472,10 +510,17 @@ message FieldSchema {
   bool stored = 15;
 }
 
-// The full field schema of a collection. v1alpha1 schemas are fixed at
-// collection creation (no dynamic mapping, no field mutation).
+// The full field schema of a collection. Set at collection creation; no
+// dynamic mapping. Evolves only through CollectionAdminService.
+// RegisterSchema, which applies wire-safe changes exclusively.
 message CollectionSchema {
   repeated FieldSchema fields = 1;
+  // The field QueryStringQuery searches when the query names no field and
+  // sets no default_field of its own. Must name a TEXT field. Unset =
+  // the first TEXT field in `fields` order (the implemented fallback);
+  // query_string queries against a collection with no TEXT field and no
+  // per-query default_field are INVALID_ARGUMENT.
+  string default_field = 2;
 }
 
 // Replication parameters for a collection.

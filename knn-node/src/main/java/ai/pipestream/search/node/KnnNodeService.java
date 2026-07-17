@@ -277,7 +277,7 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
             int internalK = (pureMode || request.getCollaborative()) ? request.getK() : request.getK() * 5;
             int visitLimit = pureMode ? Integer.MAX_VALUE : internalK * 10;
 
-            LOG.infof("[DIAGNOSTIC] Shard %d starting search for %s (K=%d, internalK=%d, visitLimit=%d, pure=%b, external=%b)",
+            LOG.debugf("Shard %d starting search for %s (k=%d, internalK=%d, visitLimit=%d, pure=%b, external=%b)",
                 shardId, qid, request.getK(), internalK, visitLimit, pureMode, externalIndex);
 
             GlobalKnnFloor sharedFloor = request.getCollaborative() ? new GlobalKnnFloor(internalK) : null;
@@ -398,7 +398,7 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                     }
                 }
 
-                LOG.infof("[DIAGNOSTIC] Shard %d search %s finished. Lucene reported %d hits, drained %d late hits, visits=%d",
+                LOG.debugf("Shard %d search %s finished. Lucene reported %d hits, drained %d late hits, visits=%d",
                     shardId, qid, td.scoreDocs.length, drained, visits.get());
 
                 emitter.emit(SearchResponse.newBuilder()
@@ -423,9 +423,6 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                         LOG.warnf(e, "Failed to release collection reader for query %s", qid);
                     }
                 }
-                if (emitter.isCancelled()) {
-                    LOG.warnf("[DIAGNOSTIC] Query %s was CANCELLED by gRPC before completion!", qid);
-                }
                 if (request.getCollaborative()) {
                     localSearches.remove(qid);
                     searchVisits.remove(qid);
@@ -448,7 +445,7 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                 floorState.advertise(update.getMinScore());
                 float newVal = floorState.floor();
                 if (newVal > oldVal) {
-                    LOG.infof("[DIAGNOSTIC] Query %s updated local floor to GLOBAL value: %.6f (Visited so far: %d)", 
+                    LOG.debugf("Query %s raised its local floor to %.6f (visited=%d)",
                         qid, newVal, visits != null ? visits.get() : -1);
                 }
             }
