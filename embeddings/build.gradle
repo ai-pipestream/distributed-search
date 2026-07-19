@@ -1,0 +1,30 @@
+// Plain-Java embedding modules: SPI, providers, and the equivalence harness.
+// Deliberately framework-free (no Quarkus/CDI); knn-node or any other host
+// wires these in as plain jars. ai.pipestream snapshots resolve from the
+// local Maven repository (see docs/INTEGRATION_PLAN.md §2).
+subprojects {
+  apply plugin: 'java-library'
+
+  java {
+    // Compiled with the current JDK, targeting 21 (Lucene 11 baseline).
+  }
+
+  tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+  }
+
+  repositories {
+    mavenLocal()
+    mavenCentral()
+  }
+
+  dependencies {
+    testImplementation platform('org.junit:junit-bom:5.12.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+  }
+
+  test {
+    useJUnitPlatform()
+  }
+}

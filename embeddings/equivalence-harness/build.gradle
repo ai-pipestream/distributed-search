@@ -1,0 +1,10 @@
+dependencies {
+  api project(':embeddings-spi')
+
+  // The harness certifies provider pairs; the providers are on the test classpath so the
+  // self-equivalence, negative-control, and live cross-provider tests can run against the
+  // real things.
+  testImplementation project(':model2vec-provider')
+  testImplementation project(':kserve-provider')
+  testImplementation project(':tei-provider')
+}

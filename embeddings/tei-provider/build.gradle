@@ -1,0 +1,34 @@
+plugins {
+  id 'com.google.protobuf' version '0.10.0'
+}
+
+dependencies {
+  api project(':embeddings-spi')
+  // REST transport (batched path).
+  implementation 'com.fasterxml.jackson.core:jackson-databind:2.19.2'
+  // gRPC transport (streaming-worker path).
+  implementation 'io.grpc:grpc-netty-shaded:1.81.0'
+  implementation 'io.grpc:grpc-protobuf:1.81.0'
+  implementation 'io.grpc:grpc-stub:1.81.0'
+  implementation 'com.google.protobuf:protobuf-java:4.35.1'
+  // Generated gRPC stubs annotate with javax.annotation.Generated.
+  compileOnly 'org.apache.tomcat:annotations-api:6.0.53'
+}
+
+protobuf {
+  protoc {
+    artifact = 'com.google.protobuf:protoc:4.35.1'
+  }
+  plugins {
+    grpc {
+      artifact = 'io.grpc:protoc-gen-grpc-java:1.81.0'
+    }
+  }
+  generateProtoTasks {
+    all().each { task ->
+      task.plugins {
+        grpc {}
+      }
+    }
+  }
+}

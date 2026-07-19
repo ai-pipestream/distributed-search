@@ -1,0 +1,9 @@
+dependencies {
+  api project(':embeddings-spi')
+  // Stub-POM snapshots from the local m2 (docs/INTEGRATION_PLAN.md §2): declare every jar.
+  api 'ai.pipestream:opennlp-embeddings:3.x-experimental-SNAPSHOT'
+  api 'ai.pipestream:opennlp-api:3.x-experimental-SNAPSHOT'
+  runtimeOnly 'ai.pipestream:opennlp-runtime:3.x-experimental-SNAPSHOT'
+  runtimeOnly 'ai.pipestream:opennlp-subword:3.x-experimental-SNAPSHOT'
+  runtimeOnly 'ai.pipestream:opennlp-cli:3.x-experimental-SNAPSHOT'
+}
