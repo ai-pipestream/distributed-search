@@ -7,4 +7,5 @@ dependencies {
   testImplementation project(':model2vec-provider')
   testImplementation project(':kserve-provider')
   testImplementation project(':tei-provider')
+  testImplementation project(':ovms-provider')
 }

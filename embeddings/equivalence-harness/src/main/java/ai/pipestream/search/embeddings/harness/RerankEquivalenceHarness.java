@@ -50,6 +50,12 @@ public final class RerankEquivalenceHarness {
   /** Default mean top-k set-overlap threshold: {@value}. */
   public static final double DEFAULT_MIN_TOPK_OVERLAP = 0.99;
 
+  /** Absolute score difference treated as a tie at the top-k cutoff: {@value}. */
+  public static final double TIE_ABSOLUTE_EPSILON = 1e-6;
+
+  /** Relative share of the cutoff score treated as a tie at the top-k cutoff: {@value}. */
+  public static final double TIE_RELATIVE_EPSILON = 1e-3;
+
   /**
    * Certify one reranker pair for one model.
    *
@@ -126,19 +132,41 @@ public final class RerankEquivalenceHarness {
   }
 
   private static double topKOverlap(List<Float> x, List<Float> y, int k) {
-    Set<Integer> topX = topKIndices(x, k);
-    Set<Integer> topY = topKIndices(y, k);
+    Set<Integer> topX = tieExpandedTopK(x, k);
+    Set<Integer> topY = tieExpandedTopK(y, k);
     Set<Integer> intersection = new HashSet<>(topX);
     intersection.retainAll(topY);
-    return intersection.size() / (double) k;
+    // The smaller set is the more discriminating one; it must be contained in the
+    // other's tie-expanded set. A monotone transform can compress a score region
+    // and expand one side's cutoff further than the other's, so the denominator is
+    // the tighter set, not k.
+    return intersection.size() / (double) Math.min(topX.size(), topY.size());
   }
 
-  private static Set<Integer> topKIndices(List<Float> scores, int k) {
+  /**
+   * The top-k set with the cutoff expanded over near-ties: documents scoring within
+   * {@value #TIE_ABSOLUTE_EPSILON} plus a {@value #TIE_RELATIVE_EPSILON} share of the
+   * query's own score range are all included. One runtime may emit exact ties where
+   * another emits the same scores at slightly different precision; without expansion
+   * the boundary picks disagree while Kendall tau (which counts ties as concordant)
+   * stays at 1.0. The range share keeps the tolerance scale-invariant: a monotone
+   * re-scaling moves the gaps and the range together.
+   */
+  private static Set<Integer> tieExpandedTopK(List<Float> scores, int k) {
     List<Integer> indices = new ArrayList<>();
     for (int i = 0; i < scores.size(); i++) {
       indices.add(i);
     }
     indices.sort(Comparator.comparingDouble((Integer i) -> scores.get(i)).reversed());
-    return new HashSet<>(indices.subList(0, Math.min(k, indices.size())));
+    float cutoff = scores.get(indices.get(Math.min(k, indices.size()) - 1));
+    float min = scores.get(indices.get(indices.size() - 1));
+    float max = scores.get(indices.get(0));
+    double eps = TIE_ABSOLUTE_EPSILON + TIE_RELATIVE_EPSILON * (max - min);
+    Set<Integer> top = new HashSet<>();
+    for (int rank = 0; rank < indices.size() && scores.get(indices.get(rank)) >= cutoff - eps;
+        rank++) {
+      top.add(indices.get(rank));
+    }
+    return top;
   }
 }

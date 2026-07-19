@@ -39,16 +39,31 @@ policy these implement.
 retrieve-then-rerank pipeline: `score(model, query, documents)` returns one
 score per document, same order, blocking, with `RerankProviders` ServiceLoader
 discovery. Implementations: `TEIRerankProvider` (TEI `POST /rerank`, maps the
-score-sorted response back to input order) and `KServeRerankProvider` (KServe
-v2 cross-encoder; query + documents as BYTES tensors, FP32 scores out, tensor
-names configurable — check `ModelMetadata` when wiring a new endpoint).
+score-sorted response back to input order), `OvmsRerankProvider` (OVMS
+Cohere-compatible `POST /v3/rerank`; the rerank graph is REST-first, its
+KServe gRPC surface is the same JSON as an opaque payload), and
+`KServeRerankProvider` (KServe v2 cross-encoder; query + documents as BYTES
+tensors, FP32 scores out, tensor names configurable — check `ModelMetadata`
+when wiring a new endpoint).
+
+OVMS rerank note: the OVMS rerank calculator assembles query/document pairs
+itself and fills `token_type_ids` with zeros, so the served cross-encoder must
+be a two-input model (no `token_type_ids`) — BAAI/bge-reranker-base certifies;
+three-input models (e.g. cross-encoder/ms-marco-MiniLM-L-6-v2) score
+degenerately there and must stay TEI-only. The tokenizer IR must be converted
+with `add_special_tokens=False` and the model config must carry
+`bos_token_id`/`eos_token_id`.
 
 The ranked-list certification (`RerankEquivalenceHarness`) uses Kendall tau
-(scale-invariant — monotone re-scalings pass by design) plus top-k set
-overlap, with the same negative-control discipline as the embedding gate. A
-true cross-runtime rerank pair runs once a second reranker endpoint exists.
-Live-test env vars: `TEI_TEST_RERANK_ENDPOINT`, `KSERVE_RERANK_ENDPOINT` /
-`TEI_RERANK_ENDPOINT` (+ `*_RERANK_MODELS`).
+(scale-invariant — monotone re-scalings pass by design) plus tie-expanded
+top-k overlap (the cutoff absorbs near-ties, so a runtime emitting exact ties
+and one emitting the same scores at different precision still agree), with
+the same negative-control discipline as the embedding gate. The first
+cross-runtime rerank pair is certified: OVMS vs TEI serving
+BAAI/bge-reranker-base (tau = 1.0, overlap = 1.0). Live-test env vars:
+`TEI_TEST_RERANK_ENDPOINT`, `OVMS_TEST_RERANK_ENDPOINT`,
+`KSERVE_RERANK_ENDPOINT` / `TEI_RERANK_ENDPOINT`, `OVMS_RERANK_ENDPOINT`
+(+ `*_RERANK_MODELS`).
 
 ## testing
 - **`equivalence-harness`** — the certification gate of the two-lane policy:

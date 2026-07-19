@@ -84,6 +84,43 @@ class RerankEquivalenceHarnessTest {
         1.0 / 3.0, RerankEquivalenceHarness.kendallTau(x, List.of(3f, 1f, 2f)), 1e-9);
   }
 
+  /**
+   * One runtime emits exact ties where another emits the same scores at slightly different
+   * precision (e.g. fp16 vs fp32 accumulation). Tau counts ties as concordant; the
+   * tie-expanded top sets must agree too, or boundary picks differ for no real reason.
+   */
+  @Test
+  void precisionTiesAtTheCutoffStillPass() {
+    List<Float> withTies = List.of(0.9f, 0.1f, 0.1f, 0.1f, 0.1f, 0.01f);
+    List<Float> nearTies = List.of(0.9f, 0.1000001f, 0.1f, 0.0999999f, 0.1f, 0.01f);
+    RerankEquivalenceReport report =
+        harness.compare(
+            fixed(withTies), fixed(nearTies), "m", List.of("q"),
+            List.of("a", "b", "c", "d", "e", "f"), 3);
+    assertEquals(1.0, report.minKendallTau(), 1e-6);
+    assertEquals(1.0, report.meanTopKOverlap(), 1e-6);
+    assertTrue(report.pass(), "precision-level ties must not fail certification: " + report);
+  }
+
+  private static RerankProvider fixed(List<Float> scores) {
+    return new RerankProvider() {
+      @Override
+      public String name() {
+        return "fixed";
+      }
+
+      @Override
+      public boolean supports(String model) {
+        return true;
+      }
+
+      @Override
+      public List<Float> score(String model, String query, List<String> documents) {
+        return scores.subList(0, documents.size());
+      }
+    };
+  }
+
   private static List<String> queries() {
     return List.of("nearest neighbor search", "engine maintenance", "classical music");
   }

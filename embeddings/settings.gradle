@@ -1,2 +1,2 @@
 rootProject.name = 'embeddings'
-include 'embeddings-spi', 'model2vec-provider', 'kserve-provider', 'tei-provider', 'equivalence-harness'
+include 'embeddings-spi', 'model2vec-provider', 'kserve-provider', 'tei-provider', 'ovms-provider', 'equivalence-harness'
