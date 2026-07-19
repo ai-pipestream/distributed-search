@@ -5,9 +5,9 @@ plugins {
 dependencies {
   api project(':embeddings-spi')
   // REST transport (batched path).
-  implementation 'com.fasterxml.jackson.core:jackson-databind:2.19.2'
+  implementation 'com.fasterxml.jackson.core:jackson-databind:2.22.1'
   // gRPC transport (streaming-worker path).
-  implementation 'io.grpc:grpc-netty-shaded:1.81.0'
+  implementation 'io.grpc:grpc-netty-shaded:1.82.2'
   implementation 'io.grpc:grpc-protobuf:1.81.0'
   implementation 'io.grpc:grpc-stub:1.81.0'
   implementation 'com.google.protobuf:protobuf-java:4.35.1'
