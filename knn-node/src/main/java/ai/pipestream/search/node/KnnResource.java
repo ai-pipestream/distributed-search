@@ -18,6 +18,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import ai.pipestream.search.discovery.ScaleCubeClusterBootstrap;
 import ai.pipestream.search.grpc.*;
 import org.apache.lucene.sandbox.search.knn.GlobalKnnFloor;
+import org.apache.lucene.sandbox.search.knn.SharedFloorKnnCollectorManager;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
@@ -150,8 +151,52 @@ public class KnnResource {
             return Uni.createFrom().failure(new IllegalArgumentException("perShardK must be at least k"));
         }
         String queryId = UUID.randomUUID().toString();
-        int shardK = perShardK > 0 ? perShardK : k;
         LOG.infof("Leader: Starting Search %s (K=%d, collab=%b, collection=%s)", queryId, k, collaborative, collection);
+
+        // The per-shard k derives from the number of shards actually searched, so peer
+        // selection must happen before it is computed. The local shard is always
+        // searched in-process, hence the + 1.
+        if (!singleNode && scalecubeBootstrap.isEnabled()) {
+            return Stork.getInstance().getService("knn-peers").getInstances()
+                    .onItem().transformToUni(instances -> {
+                        List<ServiceInstance> selectedPeers = selectPeers(instances, maxPeers);
+                        int shardK = deriveShardK(k, perShardK, collaborative, selectedPeers.size() + 1);
+                        return searchShards(queryId, vector, k, shardK, collaborative, collection, selectedPeers);
+                    });
+        }
+
+        int shardK = deriveShardK(k, perShardK, collaborative, 1);
+        return searchShards(queryId, vector, k, shardK, collaborative, collection, List.of());
+    }
+
+    /**
+     * The k each searched shard collects for this query. An explicit perShardK always wins,
+     * and non-collaborative searches keep the caller's k. A collaborative query without an
+     * explicit override derives the shard's statistically expected contribution to the
+     * merged top-k: with s searched shards each holds a 1/s share of the corpus, and the
+     * shared-floor gate for that share sizes the local queue. Never exceeds k.
+     */
+    static int deriveShardK(int k, int perShardK, boolean collaborative, int searchedShards) {
+        if (perShardK > 0) {
+            return perShardK;
+        }
+        if (!collaborative) {
+            return k;
+        }
+        int s = Math.max(1, searchedShards);
+        int shardK = Math.min(k, SharedFloorKnnCollectorManager.perShardGate(k, 1.0 / s));
+        LOG.infof("Derived per-shard k: shardK=%d (k=%d, s=%d)", shardK, k, s);
+        return shardK;
+    }
+
+    private Uni<SearchResult> searchShards(
+            String queryId,
+            List<Float> vector,
+            int k,
+            int shardK,
+            boolean collaborative,
+            String collection,
+            List<ServiceInstance> selectedPeers) {
 
         SearchRequest.Builder reqBuilder = SearchRequest.newBuilder()
                 .setQueryId(queryId)
@@ -184,16 +229,8 @@ public class KnnResource {
                 }));
 
         // 2. Peer shards
-        if (!singleNode && scalecubeBootstrap.isEnabled()) {
-            return Stork.getInstance().getService("knn-peers").getInstances()
-                    .onItem().transformToUni(instances -> {
-                        List<ServiceInstance> selectedPeers = selectPeers(instances, maxPeers);
-                        for (ServiceInstance si : selectedPeers) {
-                            allStreams.add(callPeerStreaming(si.getHost(), si.getPort(), request, resultHits, coordinatorFloor, floorDocumentIds, coordinatorBroadcaster));
-                        }
-                        return aggregateFirehoses(allStreams, resultHits, k, queryId, coordinatorFloor != null)
-                                .eventually(coordinatorBroadcaster::onComplete);
-                    });
+        for (ServiceInstance si : selectedPeers) {
+            allStreams.add(callPeerStreaming(si.getHost(), si.getPort(), request, resultHits, coordinatorFloor, floorDocumentIds, coordinatorBroadcaster));
         }
 
         return aggregateFirehoses(allStreams, resultHits, k, queryId, coordinatorFloor != null)

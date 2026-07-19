@@ -9,6 +9,7 @@ import io.smallrye.mutiny.subscription.MultiEmitter;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Singleton;
 import ai.pipestream.search.grpc.*;
+import ai.pipestream.search.discovery.ScaleCubeClusterBootstrap;
 import ai.pipestream.search.index.CollectionManager;
 import jakarta.inject.Inject;
 import org.apache.lucene.index.DirectoryReader;
@@ -83,8 +84,16 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
     private final Map<String, AtomicReference<byte[]>> searchHints = new ConcurrentHashMap<>();
     private volatile int indexVectorDimension = -1;
 
-    @ConfigProperty(name = "knn.shared-floor.global-share", defaultValue = "1.0")
-    float sharedFloorGlobalShare;
+    @Inject
+    ScaleCubeClusterBootstrap scalecubeBootstrap;
+
+    /**
+     * Explicit override for this shard's share of the corpus at the shared-floor gate.
+     * When unset, the share is derived per query from live ScaleCube membership as
+     * 1/memberCount (one shard per node), matching the coordinator's derived 1/s.
+     */
+    @ConfigProperty(name = "knn.shared-floor.global-share")
+    Optional<Float> sharedFloorGlobalShare;
 
     /** Disabled until the coordinator consumes neighborhood hints in a pruning decision. */
     @ConfigProperty(name = "knn.topology-sketch.enabled", defaultValue = "false")
@@ -344,7 +353,7 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
                             SharedFloorKnnCollectorManager.DEFAULT_FLOOR_ACTIVATION_K,
                             FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS,
                             FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL,
-                            sharedFloorGlobalShare);
+                            resolveGlobalShare());
                 } else {
                     manager = new TopKnnCollectorManager(internalK, searcher);
                 }
@@ -473,6 +482,23 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
 
     private int resolveShardId() {
         return ConfigProvider.getConfig().getOptionalValue("knn.shard.id", Integer.class).orElse(0);
+    }
+
+    /**
+     * This shard's share of the corpus for the shared-floor gate: the explicit
+     * knn.shared-floor.global-share when configured, otherwise 1/live-members from the
+     * ScaleCube cluster, matching the coordinator's 1/s. A lone node (or a disabled
+     * cluster) yields 1.0 and the manager gates at the full local queue.
+     */
+    private float resolveGlobalShare() {
+        if (sharedFloorGlobalShare.isPresent()) {
+            return sharedFloorGlobalShare.get();
+        }
+        int liveMembers = scalecubeBootstrap.isEnabled()
+                ? scalecubeBootstrap.getCluster().members().size() : 1;
+        float share = 1.0f / Math.max(1, liveMembers);
+        LOG.debugf("Derived shared-floor global share %.4f from %d live cluster member(s)", share, liveMembers);
+        return share;
     }
 
     private static float[] getVector(List<LeafReaderContext> leaves, String field, int docId) throws IOException {
