@@ -41,7 +41,8 @@ import org.junit.jupiter.api.Test;
  */
 class OvmsTeiRerankEquivalenceTest {
 
-  private static final String MODEL = "bge-reranker";
+  private static final String MODEL =
+      System.getenv().getOrDefault("OVMS_TEST_RERANK_MODEL", "bge-reranker");
   private static final String OVMS_URL =
       System.getenv().getOrDefault("OVMS_TEST_RERANK_ENDPOINT", "http://localhost:8003");
   private static final String TEI_URL =
