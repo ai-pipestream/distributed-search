@@ -4,8 +4,10 @@ plugins {
 }
 
 repositories {
-    mavenCentral()
     mavenLocal()
+    // The ai.pipestream fork snapshots (shared-floor Lucene, preview OpenNLP).
+    maven { url = uri('https://git.rokkon.com/api/packages/ai-pipestream/maven') }
+    mavenCentral()
 }
 
 dependencies {
