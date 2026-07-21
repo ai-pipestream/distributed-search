@@ -5,8 +5,23 @@ plugins {
 
 repositories {
     mavenLocal()
-    // The ai.pipestream fork snapshots (shared-floor Lucene, preview OpenNLP).
-    maven { url = uri('https://git.rokkon.com/api/packages/ai-pipestream/maven') }
+    // The ai.pipestream fork snapshots (shared-floor Lucene, preview OpenNLP) resolve from
+    // Central's snapshot repository, which every runner can reach; the ai.pipestream registry
+    // stays as a fallback. Both are scoped to the forks: without the filter, every dependency
+    // would be looked up on a host some runners cannot reach, and a slow or unreachable host
+    // would fail resolution at configuration time.
+    maven {
+        url = uri('https://central.sonatype.com/repository/maven-snapshots/')
+        content {
+            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp)(-.*)?')
+        }
+    }
+    maven {
+        url = uri('https://git.rokkon.com/api/packages/ai-pipestream/maven')
+        content {
+            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp)(-.*)?')
+        }
+    }
     mavenCentral()
 }
 
@@ -24,38 +39,39 @@ dependencies {
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-smallrye-health'
     implementation 'io.quarkus:quarkus-scheduler'
-    // The shared-floor API currently lives on the companion Lucene branch, so these artifacts
-    // cannot come from Maven Central yet. Keep the dependency explicit and portable instead of
-    // baking one developer's workspace path into the build.
+    // The shared-floor API lives on the companion Lucene branch, so these artifacts cannot
+    // come from Maven Central releases yet. Default: resolve the ai.pipestream fork snapshots
+    // as module dependencies from the repositories above, so a fresh clone builds with no
+    // local setup. Local-build overrides are all-or-nothing: luceneJar, or luceneCoreJarDir +
+    // luceneSandboxJarDir + luceneModuleJarDirs as Gradle properties or LUCENE_* environment
+    // variables.
+    def luceneForkVersion = '11.0.0-experimental-SNAPSHOT'
     def luceneJar = project.findProperty('luceneJar')
     def luceneCoreJarDir = project.findProperty('luceneCoreJarDir')
             ?: project.findProperty('luceneJarDir')
             ?: System.getenv('LUCENE_CORE_JAR_DIR')
     def luceneSandboxJarDir = project.findProperty('luceneSandboxJarDir')
             ?: System.getenv('LUCENE_SANDBOX_JAR_DIR')
+    def luceneModuleJarDirsValue = project.findProperty('luceneModuleJarDirs')
+            ?: System.getenv('LUCENE_MODULE_JAR_DIRS')
     if (luceneJar != null) {
         implementation files(luceneJar)
-    } else {
-        if (luceneCoreJarDir == null || luceneSandboxJarDir == null) {
-            throw new GradleException('Lucene artifacts are required. Set luceneCoreJarDir and '
-                    + 'luceneSandboxJarDir as Gradle properties or LUCENE_CORE_JAR_DIR and '
-                    + 'LUCENE_SANDBOX_JAR_DIR as environment variables.')
+    } else if (luceneCoreJarDir != null || luceneSandboxJarDir != null || luceneModuleJarDirsValue != null) {
+        if (luceneCoreJarDir == null || luceneSandboxJarDir == null || luceneModuleJarDirsValue == null) {
+            throw new GradleException('Local Lucene overrides are all-or-nothing: set luceneCoreJarDir, '
+                    + 'luceneSandboxJarDir, and luceneModuleJarDirs (properties or LUCENE_* environment '
+                    + 'variables) together, or unset all three to resolve the fork snapshots as modules.')
         }
         implementation fileTree(dir: luceneCoreJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
         implementation fileTree(dir: luceneSandboxJarDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
-    }
-    // Additional Lucene modules for the query compiler: analyzers (english/keyword/...)
-    // and the classic QueryParser. Same locally-built tree as lucene-core above;
-    // override with -PluceneModuleJarDirs=<dir1>,<dir2>.
-    def luceneModuleJarDirsValue = project.findProperty('luceneModuleJarDirs')
-            ?: System.getenv('LUCENE_MODULE_JAR_DIRS')
-    if (luceneModuleJarDirsValue == null) {
-        throw new GradleException('Lucene analysis and queryparser artifacts are required. Set '
-                + 'luceneModuleJarDirs or LUCENE_MODULE_JAR_DIRS to a comma-separated directory list.')
-    }
-    def luceneModuleJarDirs = luceneModuleJarDirsValue.split(',')
-    luceneModuleJarDirs.each { moduleDir ->
-        implementation fileTree(dir: moduleDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
+        luceneModuleJarDirsValue.split(',').each { moduleDir ->
+            implementation fileTree(dir: moduleDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
+        }
+    } else {
+        implementation "ai.pipestream:lucene-core:${luceneForkVersion}"
+        implementation "ai.pipestream:lucene-sandbox:${luceneForkVersion}"
+        implementation "ai.pipestream:lucene-analysis-common:${luceneForkVersion}"
+        implementation "ai.pipestream:lucene-queryparser:${luceneForkVersion}"
     }
     // Rerank SPI for the coordinator rerank head. The sibling plain-Java
     // embeddings build is wired as a composite (see settings.gradle); the
