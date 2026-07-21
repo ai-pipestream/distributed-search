@@ -7,6 +7,7 @@ Start here:
 - [ProtoMolt integration](PROTOMOLT_INTEGRATION.md): ownership boundary and migration plan
 - [Search API v1 RFC](rfc/SEARCH_API_V1.md): proposed public API
 - [Schema-as-proto RFC](rfc/SCHEMA_AS_PROTO.md): current experimental schema dialect
+- [Document-centric search RFC](rfc/DOC_CENTRIC_SEARCH_V1.md): proposed chunk-grouped document search with shard-local block joins and a shared parent-score floor
 
 ## Implementation-backed design
 
