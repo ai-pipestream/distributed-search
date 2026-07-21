@@ -10,7 +10,8 @@ policy these implement.
   `META-INF/services`; a model no provider supports fails loud.
 - **`model2vec-provider`** — in-process provider ("fast lane" default) backed
   by OpenNLP static embeddings
-  (`ai.pipestream:opennlp-embeddings:3.x-experimental-SNAPSHOT`, local m2).
+  (`ai.pipestream:opennlp-embeddings:3.x-preview-SNAPSHOT`, resolves from the
+  ai.pipestream snapshot repositories).
   Default model: **potion-retrieval-32M** (512-dim; BEIR SciFact recall@10
   0.795 vs 0.808 for the all-MiniLM-L6-v2 transformer — near-teacher quality
   at static cost). Model registry: properties file of

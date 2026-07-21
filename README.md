@@ -12,8 +12,8 @@ an RFC as a live endpoint.
 
 > **Status:** developer preview. The core algorithms and focused tests exist,
 > but the project is not yet a supported production service. TLS, replication,
-> failure recovery, a stable public API, reproducible Lucene artifacts, and
-> production observability remain release blockers.
+> failure recovery, a stable public API, pinned (non-snapshot) Lucene
+> artifacts, and production observability remain release blockers.
 
 ## What is implemented
 
@@ -22,6 +22,11 @@ an RFC as a live endpoint.
 - Single-node and ScaleCube-discovered multi-node execution
 - Collection creation, document indexing, deletion, and persisted local shards
 - Server-side embeddings through a configurable DJL endpoint
+- Optional cross-encoder rerank head on the coordinator (see
+  [knn-node](knn-node/README.md#rerank-head))
+- Plain-Java embedding and rerank provider SPI with TEI, OpenVINO/KServe, and
+  model2vec providers, plus a cross-provider equivalence harness
+  ([embeddings](embeddings/README.md))
 - Schema-as-proto compilation and compatibility classification
 - Typed query AST compilation for text, range, Boolean, vector, and hybrid queries
 - Reciprocal-rank and weighted-linear fusion
@@ -44,9 +49,25 @@ and the [documentation index](docs/README.md) for the full breakdown.
 
 ## Build
 
-The engine currently depends on the companion Lucene shared-floor branch. Build
-Lucene core, sandbox, analysis-common, and queryparser first, then provide their
-artifact directories explicitly:
+A fresh clone builds with no local setup: the shared-floor Lucene fork
+(`ai.pipestream:lucene-*:11.0.0-experimental-SNAPSHOT`) and the OpenNLP
+preview modules (`ai.pipestream:opennlp-*:3.x-preview-SNAPSHOT`) resolve as
+module dependencies from Central's snapshot repository, with the
+ai.pipestream registry as a fallback and `mavenLocal` first for developer
+overrides. `knn-node` needs JDK 25; the embeddings modules target 21.
+
+```shell
+cd knn-node
+./gradlew compileJava
+```
+
+CI runs exactly this plus the plain-JUnit suites on every push and pull
+request ([ci.yml](.github/workflows/ci.yml)). The Quarkus-boot test suites
+are deliberately excluded; run them locally when the machine is free.
+
+To build against a local Lucene checkout instead (Lucene development), build
+the four modules and point the build at their artifact directories. The
+overrides are all-or-nothing: set all three, or none to use the snapshots.
 
 ```shell
 cd /path/to/lucene
@@ -75,11 +96,11 @@ LUCENE_ROOT=/path/to/lucene ./run-tests.sh
 
 ```shell
 cd knn-node
-./gradlew quarkusDev \
-  -PluceneCoreJarDir=/path/to/lucene/lucene/core/build/libs \
-  -PluceneSandboxJarDir=/path/to/lucene/lucene/sandbox/build/libs \
-  -PluceneModuleJarDirs=/path/to/lucene/lucene/analysis/common/build/libs,/path/to/lucene/lucene/queryparser/build/libs
+./gradlew quarkusDev
 ```
+
+(For a local Lucene build, pass the same `-P` properties or `LUCENE_*`
+environment variables described under [Build](#build).)
 
 HTTP and gRPC share port `48100`. Useful development endpoints are:
 
