@@ -10,3 +10,13 @@ pluginManagement {
 }
 
 rootProject.name='knn-node'
+
+// Composite build against the sibling plain-Java embeddings build: module
+// dependencies on 'ai.pipestream.search:embeddings-spi' / ':tei-provider' in
+// build.gradle resolve to these included projects.
+includeBuild('../embeddings') {
+    dependencySubstitution {
+        substitute module('ai.pipestream.search:embeddings-spi') using project(':embeddings-spi')
+        substitute module('ai.pipestream.search:tei-provider') using project(':tei-provider')
+    }
+}

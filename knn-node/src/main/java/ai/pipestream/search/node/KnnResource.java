@@ -16,6 +16,8 @@ import jakarta.ws.rs.core.MediaType;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import ai.pipestream.search.discovery.ScaleCubeClusterBootstrap;
+import ai.pipestream.search.embeddings.RerankProvider;
+import ai.pipestream.search.embeddings.RerankProviders;
 import ai.pipestream.search.grpc.*;
 import org.apache.lucene.sandbox.search.knn.GlobalKnnFloor;
 import org.apache.lucene.sandbox.search.knn.SharedFloorKnnCollectorManager;
@@ -27,6 +29,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.Random;
 import java.util.UUID;
@@ -52,6 +55,21 @@ public class KnnResource {
 
     @ConfigProperty(name = "knn.single.node", defaultValue = "false")
     boolean singleNode;
+
+    /** Master switch for the coordinator rerank head; off means zero behavior change. */
+    @ConfigProperty(name = "knn.rerank.enabled", defaultValue = "false")
+    boolean rerankEnabled;
+
+    /** Selects a registered {@link RerankProvider} by name (e.g. "tei"); unset picks by model. */
+    @ConfigProperty(name = "knn.rerank.provider")
+    Optional<String> rerankProviderName;
+
+    /** Model id passed to the provider's score call; also used to pick a provider when no name is set. */
+    @ConfigProperty(name = "knn.rerank.model")
+    Optional<String> rerankModel;
+
+    /** Resolved lazily on first use and cached; null until then or when rerank is disabled. */
+    private volatile RerankProvider rerankProvider;
 
     @Inject
     @io.quarkus.grpc.GrpcService
@@ -104,7 +122,7 @@ public class KnnResource {
                     if (embeddings.isEmpty()) {
                         return Uni.createFrom().failure(new IllegalStateException("No embeddings from DJL"));
                     }
-                    return leaderSearch(topK, embeddings.get(0), collaborative, maxPeers, perShardK, collection);
+                    return leaderSearch(topK, embeddings.get(0), collaborative, maxPeers, perShardK, collection, text);
                 });
     }
 
@@ -143,6 +161,18 @@ public class KnnResource {
             @QueryParam("maxPeers") @DefaultValue("-1") int maxPeers,
             @QueryParam("perShardK") @DefaultValue("-1") int perShardK,
             @QueryParam("collection") @DefaultValue("") String collection) {
+        // Raw-vector searches carry no query text, so the rerank head never applies here.
+        return leaderSearch(k, vector, collaborative, maxPeers, perShardK, collection, null);
+    }
+
+    private Uni<SearchResult> leaderSearch(
+            int k,
+            List<Float> vector,
+            boolean collaborative,
+            int maxPeers,
+            int perShardK,
+            String collection,
+            String queryText) {
 
         if (k <= 0) {
             return Uni.createFrom().failure(new IllegalArgumentException("k must be positive"));
@@ -161,12 +191,12 @@ public class KnnResource {
                     .onItem().transformToUni(instances -> {
                         List<ServiceInstance> selectedPeers = selectPeers(instances, maxPeers);
                         int shardK = deriveShardK(k, perShardK, collaborative, selectedPeers.size() + 1);
-                        return searchShards(queryId, vector, k, shardK, collaborative, collection, selectedPeers);
+                        return searchShards(queryId, vector, k, shardK, collaborative, collection, selectedPeers, queryText);
                     });
         }
 
         int shardK = deriveShardK(k, perShardK, collaborative, 1);
-        return searchShards(queryId, vector, k, shardK, collaborative, collection, List.of());
+        return searchShards(queryId, vector, k, shardK, collaborative, collection, List.of(), queryText);
     }
 
     /**
@@ -196,7 +226,8 @@ public class KnnResource {
             int shardK,
             boolean collaborative,
             String collection,
-            List<ServiceInstance> selectedPeers) {
+            List<ServiceInstance> selectedPeers,
+            String queryText) {
 
         SearchRequest.Builder reqBuilder = SearchRequest.newBuilder()
                 .setQueryId(queryId)
@@ -233,7 +264,7 @@ public class KnnResource {
             allStreams.add(callPeerStreaming(si.getHost(), si.getPort(), request, resultHits, coordinatorFloor, floorDocumentIds, coordinatorBroadcaster));
         }
 
-        return aggregateFirehoses(allStreams, resultHits, k, queryId, coordinatorFloor != null)
+        return aggregateFirehoses(allStreams, resultHits, k, queryId, coordinatorFloor != null, queryText)
                 .eventually(coordinatorBroadcaster::onComplete);
     }
 
@@ -302,9 +333,10 @@ public class KnnResource {
                 });
     }
 
-    private Uni<SearchResult> aggregateFirehoses(List<Multi<SearchResponse>> streams, 
+    private Uni<SearchResult> aggregateFirehoses(List<Multi<SearchResponse>> streams,
                                                List<KnnNodeService.SearchHit> resultHits,
-                                               int k, String qid, boolean collaborative) {
+                                               int k, String qid, boolean collaborative,
+                                               String queryText) {
         long startTime = System.currentTimeMillis();
         AtomicLong totalVisited = new AtomicLong(0);
         AtomicInteger finishedShards = new AtomicInteger(0);
@@ -319,17 +351,62 @@ public class KnnResource {
                 .collect().last() 
                 .ifNoItem().after(Duration.ofSeconds(30)).fail()
                 .onItem().transform(ignored -> {
-                    List<KnnNodeService.SearchHit> sortedResults;
+                    List<KnnNodeService.SearchHit> candidates;
                     synchronized (resultHits) {
-                        sortedResults = new ArrayList<>(resultHits);
+                        candidates = new ArrayList<>(resultHits);
                     }
-                    sortedResults.sort((a, b) -> Float.compare(b.score, a.score));
-                    List<KnnNodeService.SearchHit> topK = sortedResults.size() > k
-                            ? new ArrayList<>(sortedResults.subList(0, k)) : new ArrayList<>(sortedResults);
-                    LOG.infof("Query %s COMPLETE. Hits=%d, Shards=%d, Visited=%d", 
-                        qid, topK.size(), finishedShards.get(), totalVisited.get());
-                    return new SearchResult(topK, totalVisited.get(), System.currentTimeMillis() - startTime, collaborative);
+                    // Resolved once and cached; an enabled-but-unresolvable provider fails the
+                    // query loudly here instead of silently skipping the rerank stage.
+                    RerankProvider provider = rerankProvider();
+                    boolean reranked = RerankStage.applies(provider, queryText, candidates);
+                    List<KnnNodeService.SearchHit> topK = RerankStage.apply(
+                            provider, rerankModel.orElse(null), queryText, candidates, k);
+                    LOG.infof("Query %s COMPLETE. Hits=%d, Shards=%d, Visited=%d, Reranked=%b",
+                        qid, topK.size(), finishedShards.get(), totalVisited.get(), reranked);
+                    return new SearchResult(topK, totalVisited.get(), System.currentTimeMillis() - startTime, collaborative, reranked);
                 });
+    }
+
+    /**
+     * The enabled rerank provider, resolved via ServiceLoader on first use and cached.
+     * Returns null when rerank is disabled. Throws IllegalStateException when rerank is
+     * enabled but no registered provider matches the configured name or model.
+     */
+    private RerankProvider rerankProvider() {
+        if (!rerankEnabled) {
+            return null;
+        }
+        RerankProvider provider = rerankProvider;
+        if (provider == null) {
+            synchronized (this) {
+                provider = rerankProvider;
+                if (provider == null) {
+                    provider = resolveRerankProvider();
+                    rerankProvider = provider;
+                }
+            }
+        }
+        return provider;
+    }
+
+    private RerankProvider resolveRerankProvider() {
+        List<RerankProvider> registered = RerankProviders.load();
+        if (rerankProviderName.isPresent()) {
+            String name = rerankProviderName.get();
+            return registered.stream()
+                    .filter(p -> p.name().equals(name))
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException(
+                            "knn.rerank.enabled=true but no rerank provider named '" + name
+                                    + "' is registered; registered providers: "
+                                    + registered.stream().map(RerankProvider::name).toList()));
+        }
+        if (rerankModel.isEmpty() || rerankModel.get().isBlank()) {
+            throw new IllegalStateException(
+                    "knn.rerank.enabled=true requires knn.rerank.provider or knn.rerank.model; registered providers: "
+                            + registered.stream().map(RerankProvider::name).toList());
+        }
+        return RerankProviders.forModel(rerankModel.get());
     }
 
     private ComparisonResult buildComparison(SearchResult standard, SearchResult collaborative, int k) {
@@ -370,12 +447,17 @@ public class KnnResource {
         public long totalVisited;
         public long searchTimeMs;
         public boolean collaborative;
+        public boolean reranked;
         public SearchResult() {}
         public SearchResult(List<KnnNodeService.SearchHit> hits, long totalVisited, long searchTimeMs, boolean collaborative) {
+            this(hits, totalVisited, searchTimeMs, collaborative, false);
+        }
+        public SearchResult(List<KnnNodeService.SearchHit> hits, long totalVisited, long searchTimeMs, boolean collaborative, boolean reranked) {
             this.hits = hits;
             this.totalVisited = totalVisited;
             this.searchTimeMs = searchTimeMs;
             this.collaborative = collaborative;
+            this.reranked = reranked;
         }
     }
 

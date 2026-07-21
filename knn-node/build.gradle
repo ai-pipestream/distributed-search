@@ -57,6 +57,12 @@ dependencies {
     luceneModuleJarDirs.each { moduleDir ->
         implementation fileTree(dir: moduleDir, include: '*.jar', exclude: ['*-sources.jar', '*-javadoc.jar'])
     }
+    // Rerank SPI for the coordinator rerank head. The sibling plain-Java
+    // embeddings build is wired as a composite (see settings.gradle); the
+    // tei-provider jar puts a real RerankProvider on the runtime classpath
+    // for ServiceLoader discovery.
+    implementation 'ai.pipestream.search:embeddings-spi'
+    runtimeOnly 'ai.pipestream.search:tei-provider'
     testImplementation 'io.quarkus:quarkus-junit'
     testImplementation 'io.rest-assured:rest-assured'
 }

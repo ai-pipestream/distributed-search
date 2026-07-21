@@ -102,6 +102,14 @@ Per-platform defaults come from harness measurements, not guesses. TEI is
 client, similar in effort to the DJL one. The router prefers the fastest
 *ready certified* endpoint per model rather than hard pinning.
 
+**Landed:** the coordinator rerank head described by the TEI row is wired in
+`knn-node`. Merged shard candidates are rescored by a `RerankProvider` before
+top-k truncation when `knn.rerank.enabled=true` (default false), with
+`knn.rerank.provider` selecting a registered provider by name and
+`knn.rerank.model` pinning the reranker model id. `tei-provider` ships on the
+runtime classpath, and the head skips automatically when candidates carry no
+chunk text (external-index benchmarks) or the search has no query text.
+
 ## 6. Embedding SPI
 
 Plain Java, `java.util.ServiceLoader`, blocking JDK-types interface

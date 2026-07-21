@@ -5,6 +5,11 @@
 subprojects {
   apply plugin: 'java-library'
 
+  // Coordinates so composite-build consumers (knn-node) can substitute module
+  // dependencies like 'ai.pipestream.search:embeddings-spi'.
+  group = 'ai.pipestream.search'
+  version = '1.0.0-SNAPSHOT'
+
   java {
     // Compiled with the current JDK, targeting 21 (Lucene 11 baseline).
   }

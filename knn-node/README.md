@@ -36,7 +36,31 @@ Useful runtime configuration:
 | `knn.grpc.plaintext` | Development-only peer transport override |
 | `knn.pure-mode` | Disable internal k scaling and visit limits for fair comparisons |
 | `knn.external-index-path` | Read-only benchmark index |
+| `knn.rerank.enabled` | Enable the coordinator rerank head (default false) |
+| `knn.rerank.provider` | Rerank provider name, e.g. `tei`; unset picks by model |
+| `knn.rerank.model` | Reranker model id passed to the provider |
 | `djl-api/mp-rest/url` | Server-side embedding endpoint |
+
+## Rerank head
+
+Text searches (`GET /search/text`) can optionally rescore the merged shard
+candidates with a cross-encoder before the final top-k truncation. The
+retrieve stage still runs on kNN score; the reranker only reorders the
+candidate pool the shards returned, so `perShardK` controls how deep that
+pool is. The response carries `reranked: true` when the head was applied.
+
+The head is off by default and configured with three keys:
+`knn.rerank.enabled` (default `false`), `knn.rerank.provider` (provider name
+such as `tei`; when unset the first provider supporting the model is used),
+and `knn.rerank.model` (the reranker model id). Providers are discovered via
+`ServiceLoader` from the `embeddings-spi` SPI; the TEI provider is on the
+runtime classpath. Enabling rerank with no matching provider fails the query
+with an `IllegalStateException` instead of silently skipping.
+
+Rerank applies only when there is something to score. The raw-vector
+`POST /search` endpoint has no query text, and external-index benchmarks
+store no chunk text on hits, so both fall back to plain kNN score order.
+
 
 Do not expose a multi-node deployment to an untrusted network while peer
 plaintext mode is enabled.
