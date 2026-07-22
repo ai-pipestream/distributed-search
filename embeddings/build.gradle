@@ -35,6 +35,13 @@ subprojects {
     mavenCentral()
   }
 
+  configurations.configureEach {
+    // The OpenNLP preview snapshots move under this build; a restored CI
+    // cache plus Gradle's default 24h snapshot TTL would serve yesterday's
+    // jars. Always re-check changing modules (cheap metadata HEADs).
+    resolutionStrategy.cacheChangingModulesFor 0, 'seconds'
+  }
+
   dependencies {
     testImplementation platform('org.junit:junit-bom:5.14.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
