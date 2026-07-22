@@ -103,6 +103,12 @@ message Collection {
   CollectionStats stats = 6;
   // Current shard placement.
   repeated ShardInfo shards = 7;
+  // The immutable identity every write resolves against. Never "latest".
+  // Unset until a proto schema is registered.
+  SchemaPin schema_pin = 8;
+  // Fully qualified chunk message for document-centric collections; empty
+  // for flat collections.
+  string chunk_message = 9;
 }
 
 message CollectionStats {
@@ -177,6 +183,11 @@ message SchemaSource {
   google.protobuf.FileDescriptorSet descriptor_set = 1;
   // Fully qualified root message name, e.g. "acme.catalog.Product".
   string root_message = 2;
+  // Fully qualified chunk message, e.g. "acme.kb.ArticleChunk". Present =
+  // this is a document-centric collection: Chunk.payload Anys are validated
+  // against THIS name, never trusted from their type_url.
+  // Empty = flat; IndexParentDocument frames are FAILED_PRECONDITION.
+  string chunk_message = 3;
 }
 
 // How one schema difference relates to existing data. The referee applies

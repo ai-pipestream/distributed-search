@@ -165,6 +165,55 @@ message Representation {
   optional bool doc_values = 6;
   // Required when type = FIELD_TYPE_VECTOR.
   VectorOptions vector = 7;
+  // Mode A: derive this VECTOR representation server-side by chunking the
+  // source TEXT field and embedding each chunk. Valid only when
+  // type = FIELD_TYPE_VECTOR on a string/TEXT source field.
+  // Unset = the client supplies "<field>#<name>" values (today's behavior).
+  ChunkAndEmbed derive = 8;
+}
+
+// Server-side chunk-and-embed derivation. Everything here participates in
+// the collection's plan digest: changing any of it is a re-chunk of the
+// corpus, never a silent divergence between writers.
+message ChunkAndEmbed {
+  // Embedding model id, resolved via the embeddings SPI. Required; the
+  // provider's dims(model) must equal VectorOptions.dims or RegisterSchema
+  // fails INVALID_ARGUMENT.
+  string model = 1;
+  // Provider id, or empty = any provider supporting `model`.
+  string provider = 2;
+  // Model revision pin (TEI model_sha / OVMS version / model2vec dir sha).
+  string model_revision = 3;
+  // Explicit normalization; closes provider transport divergences that
+  // cosine hides and DOT_PRODUCT does not.
+  bool normalize = 4;
+  ChunkSpec spec = 5;
+  // Store the chunk text on each child document. Default false: children
+  // always carry char offsets, so text is reconstructible from the parent
+  // store without duplicating the corpus into every vector shard.
+  bool store_chunk_text = 6;
+  // NLP layers to annotate at index time and persist per chunk (returned on
+  // ChunkHit.nlp and GetDocument chunks). Supported today: "tokens"
+  // (model-free), "sentences" (requires an opennlp:<sha256> boundary pin in
+  // spec.boundary). Annotations are a pure function of (text, layer, pinned
+  // models) and participate in the plan digest via this config.
+  repeated string nlp_layers = 7;
+}
+
+// How the server chunks a mode-A parent. MUST be a pure function of
+// (text, this message): the same pair produces the same boundaries on every
+// node, forever.
+message ChunkSpec {
+  string strategy = 1;        // "" = "sentence-packed"
+  int32 target_tokens = 2;    // 0 = 384
+  int32 overlap_tokens = 3;   // 0 = 64
+  int32 min_tokens = 4;       // 0 = 32
+  int32 max_tokens = 5;       // 0 = 512
+  string boundary = 6;        // "" = "rules-v1"
+  string tokenizer = 7;       // "" = best tier for the pinned model
+  // Bumped by ANY behavior change in the chunker implementation; part of
+  // the plan digest.
+  int32 impl_version = 8;
 }
 
 // Per-field indexing directives; attach as

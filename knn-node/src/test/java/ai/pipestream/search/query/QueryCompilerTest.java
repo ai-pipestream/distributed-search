@@ -203,7 +203,7 @@ class QueryCompilerTest {
                         .setCollaborative(true)
                         .setVisitBudget(1234)));
         QueryPlan.Single single = assertInstanceOf(QueryPlan.Single.class, plan);
-        assertEquals(List.of(new QueryPlan.KnnHints("embedding", true, 1234)), single.knnHints());
+        assertEquals(List.of(new QueryPlan.KnnHints("embedding", true, 1234, false, 3)), single.knnHints());
     }
 
     @Test
@@ -213,7 +213,7 @@ class QueryCompilerTest {
                 .addMust(Ast.knn(Ast.knnBuilder("embedding", 2, 1.0f, 0.0f, 0.0f).setVisitBudget(99)))
                 .build());
         QueryPlan plan = fixture.compile(query);
-        assertEquals(List.of(new QueryPlan.KnnHints("embedding", false, 99)), plan.knnHints());
+        assertEquals(List.of(new QueryPlan.KnnHints("embedding", false, 99, false, 2)), plan.knnHints());
     }
 
     // -- match_all / query_string / boost --------------------------------------

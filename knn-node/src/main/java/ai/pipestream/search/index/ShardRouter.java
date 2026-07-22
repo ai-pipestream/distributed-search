@@ -45,6 +45,53 @@ public class ShardRouter {
     boolean singleNode;
 
     /**
+     * Where a document belongs: this node, a specific remote owner, or an
+     * owned-by-nobody shard (cluster mode, no primary advertising the shard).
+     * Protocol-agnostic — v1alpha1 and legacy services both route through it.
+     */
+    public record Route(int shardId, Target target, String host, int port) {
+        public enum Target { LOCAL, REMOTE, NO_OWNER }
+
+        static Route local(int shardId) {
+            return new Route(shardId, Target.LOCAL, "", 0);
+        }
+
+        static Route remote(int shardId, String host, int port) {
+            return new Route(shardId, Target.REMOTE, host, port);
+        }
+
+        static Route noOwner(int shardId) {
+            return new Route(shardId, Target.NO_OWNER, "", 0);
+        }
+    }
+
+    /**
+     * True when every shard of every collection is served by this node
+     * (single-node mode or cluster membership disabled). Multi-shard block
+     * fan-out currently requires this.
+     */
+    public boolean allShardsLocal() {
+        return singleNode || !clusterBootstrap.isEnabled();
+    }
+
+    /**
+     * Decides placement for one document id. LOCAL in single-node mode, when
+     * the cluster is disabled, or when this node owns the target shard;
+     * REMOTE when a primary owner is advertising the shard; NO_OWNER otherwise
+     * (callers must reject the write rather than indexing into a shard this
+     * node does not own).
+     */
+    public Route route(String collection, int numShards, String docId) {
+        int targetShard = collections.routeToShard(docId, numShards);
+        if (singleNode || targetShard == localShardId || !clusterBootstrap.isEnabled()) {
+            return Route.local(targetShard);
+        }
+        return findOwner(targetShard, collection)
+                .map(owner -> Route.remote(targetShard, owner.host(), owner.port()))
+                .orElseGet(() -> Route.noOwner(targetShard));
+    }
+
+    /**
      * Route an index request to the correct shard owner.
      * If the target shard is local or no remote owner is found, calls localIndexFn.
      * Otherwise forwards via gRPC to the remote owner.

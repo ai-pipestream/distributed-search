@@ -119,6 +119,28 @@ public final class SchemaCompiler {
     if (!conflicts.isEmpty()) {
       return new Result(new CompiledSchema(rootMessageFullName, "standard", List.of()), conflicts);
     }
+    Map<String, FileDescriptor> built = buildFileDescriptors(set);
+    Descriptor root = null;
+    for (FileDescriptor fd : built.values()) {
+      Descriptor d = findMessage(fd, rootMessageFullName);
+      if (d != null) {
+        root = d;
+        break;
+      }
+    }
+    if (root == null) {
+      throw new IllegalArgumentException("root message not found: " + rootMessageFullName);
+    }
+    return compile(root);
+  }
+
+  /**
+   * Builds every FileDescriptor of a set in dependency order. Shared by
+   * compilation and by the pinned-descriptor resolver that unpacks
+   * {@code google.protobuf.Any} payloads reflectively.
+   */
+  public static Map<String, FileDescriptor> buildFileDescriptors(FileDescriptorSet set)
+      throws Descriptors.DescriptorValidationException {
     Map<String, FileDescriptor> built = new HashMap<>();
     List<FileDescriptorProto> pending = new ArrayList<>(set.getFileList());
     while (pending.isEmpty() == false) {
@@ -155,18 +177,18 @@ public final class SchemaCompiler {
                 + pending.stream().map(FileDescriptorProto::getName).toList());
       }
     }
-    Descriptor root = null;
-    for (FileDescriptor fd : built.values()) {
-      Descriptor d = findMessage(fd, rootMessageFullName);
+    return built;
+  }
+
+  /** Finds a message by fully qualified name across built file descriptors. */
+  public static Descriptor findMessage(java.util.Collection<FileDescriptor> files, String fullName) {
+    for (FileDescriptor fd : files) {
+      Descriptor d = findMessage(fd, fullName);
       if (d != null) {
-        root = d;
-        break;
+        return d;
       }
     }
-    if (root == null) {
-      throw new IllegalArgumentException("root message not found: " + rootMessageFullName);
-    }
-    return compile(root);
+    return null;
   }
 
   /** Compiles a root message descriptor into the internal schema. */

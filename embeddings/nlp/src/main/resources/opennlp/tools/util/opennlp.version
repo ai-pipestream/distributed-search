@@ -1,0 +1,11 @@
+# TEMPORARY SHADOW of the same resource inside ai.pipestream:opennlp-runtime.
+#
+# The published 3.x-preview-SNAPSHOT jars bake "OpenNLP-Version:
+# 3.x-preview-SNAPSHOT" here, and OpenNLP's own Version.parse requires
+# major.minor.patch, so every BaseModel create/load throws
+# NumberFormatException before doing anything. Project resources precede
+# dependency jars on the classpath, so this parseable stand-in wins.
+#
+# DELETE this file the moment the fork publishes a parseable version string
+# (e.g. 3.0.0-preview-SNAPSHOT) in its own opennlp.version resource.
+OpenNLP-Version: 3.0.0-SNAPSHOT

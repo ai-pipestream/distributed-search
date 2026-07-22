@@ -393,10 +393,18 @@ public class QueryCompiler {
             for (int i = 0; i < valueCount; i++) {
                 target[i] = knn.getVector().getValues(i);
             }
-            knnHints.add(new QueryPlan.KnnHints(field.getName(), knn.getCollaborative(), knn.getVisitBudget()));
+            knnHints.add(new QueryPlan.KnnHints(field.getName(), knn.getCollaborative(),
+                    knn.getVisitBudget(), knn.getDocumentCentric(), knn.getK()));
             // num_candidates (ef_search) is the Lucene k: the query gathers that
             // many candidates per shard; execution trims to the requested top-k.
             int luceneK = knn.getNumCandidates() > 0 ? knn.getNumCandidates() : knn.getK();
+            if (knn.getDocumentCentric()) {
+                // Compiles to a marker: the executor swaps in the block-join
+                // query, which needs a per-shard BitSetProducer the compiler
+                // (reader-free by design) cannot build.
+                return new DocumentCentricKnnQuery(field.getName(), target,
+                        knn.getK(), luceneK, filter);
+            }
             return new KnnFloatVectorQuery(field.getName(), target, luceneK, filter);
         }
 

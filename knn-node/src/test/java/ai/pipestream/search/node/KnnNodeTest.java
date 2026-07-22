@@ -57,8 +57,17 @@ public class KnnNodeTest {
                 throw new RuntimeException("Failed to index test data", e);
             }
 
+            Path dataDir;
+            try {
+                dataDir = Files.createTempDirectory("knn-test-data-");
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to create temp data dir", e);
+            }
             return Map.of(
                     "knn.index.path", tempIndexDir.toAbsolutePath().toString(),
+                    // Collections must not land in the module directory, where a
+                    // stale index from a failed run masks regressions on the next.
+                    "knn.data.dir", dataDir.toAbsolutePath().toString(),
                     "knn.shard.id", "0",
                     "knn.single.node", "true",
                     "knn.pure-mode", "true",

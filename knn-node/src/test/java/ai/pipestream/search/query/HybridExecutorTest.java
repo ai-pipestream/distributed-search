@@ -90,7 +90,7 @@ class HybridExecutorTest {
                 Ast.knn(Ast.knnBuilder("embedding", 3, 1.0f, 0.0f, 0.0f)
                         .setCollaborative(true)
                         .setVisitBudget(500))));
-        assertEquals(List.of(new QueryPlan.KnnHints("embedding", true, 500)), plan.knnHints());
+        assertEquals(List.of(new QueryPlan.KnnHints("embedding", true, 500, false, 3)), plan.knnHints());
     }
 
     @Test

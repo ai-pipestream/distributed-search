@@ -4,7 +4,13 @@ plugins {
 }
 
 repositories {
-    mavenLocal()
+    // Never on CI: the gate proves a fresh clone builds from published
+    // artifacts, and runner ~/.m2 state (anything a previous job or another
+    // agent published locally) silently outranks fresh snapshots because
+    // mavenLocal is consulted first and has no cache TTL.
+    if (System.getenv('CI') == null) {
+        mavenLocal()
+    }
     // The ai.pipestream fork snapshots (shared-floor Lucene, preview OpenNLP) resolve from
     // Central's snapshot repository, which every runner can reach; the ai.pipestream registry
     // stays as a fallback. Both are scoped to the forks: without the filter, every dependency
@@ -13,16 +19,35 @@ repositories {
     maven {
         url = uri('https://central.sonatype.com/repository/maven-snapshots/')
         content {
-            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp)(-.*)?')
+            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp|protomolt)(-.*)?')
         }
     }
     maven {
         url = uri('https://git.rokkon.com/api/packages/ai-pipestream/maven')
         content {
+            // Deliberately NOT protomolt: this registry holds an old manual
+            // protomolt push, and any repo that can serve the module may win
+            // on a cached runner. Protomolt snapshots come from Central only.
             includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp)(-.*)?')
         }
     }
     mavenCentral()
+}
+
+configurations.configureEach {
+    resolutionStrategy {
+        // ProtoMolt gencode is compiled with protoc 4.35.1 while the Quarkus
+        // platform pins the 4.35.0 runtime, and protobuf rejects gencode newer
+        // than its runtime at class-load time. Force the patch bump; force wins
+        // over the enforced platform.
+        force 'com.google.protobuf:protobuf-java:4.35.1'
+        force 'com.google.protobuf:protobuf-java-util:4.35.1'
+        // The fork and protomolt snapshots move under this build. Gradle's
+        // default 24h snapshot TTL makes a restored CI cache serve yesterday's
+        // jars and fail compiles against classes that are already published;
+        // always re-check changing modules (cheap metadata HEADs).
+        cacheChangingModulesFor 0, 'seconds'
+    }
 }
 
 dependencies {
@@ -39,6 +64,7 @@ dependencies {
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-smallrye-health'
     implementation 'io.quarkus:quarkus-scheduler'
+    implementation 'io.quarkus:quarkus-micrometer'
     // The shared-floor API lives on the companion Lucene branch, so these artifacts cannot
     // come from Maven Central releases yet. Default: resolve the ai.pipestream fork snapshots
     // as module dependencies from the repositories above, so a fresh clone builds with no
@@ -72,6 +98,9 @@ dependencies {
         implementation "ai.pipestream:lucene-sandbox:${luceneForkVersion}"
         implementation "ai.pipestream:lucene-analysis-common:${luceneForkVersion}"
         implementation "ai.pipestream:lucene-queryparser:${luceneForkVersion}"
+        // Block-join document-centric kNN: DiversifyingChildren* queries plus the
+        // fork's SharedFloorDiversifyingKnnCollectorManager composition.
+        implementation "ai.pipestream:lucene-join:${luceneForkVersion}"
     }
     // Rerank SPI for the coordinator rerank head. The sibling plain-Java
     // embeddings build is wired as a composite (see settings.gradle); the
@@ -79,6 +108,19 @@ dependencies {
     // for ServiceLoader discovery.
     implementation 'ai.pipestream.search:embeddings-spi'
     runtimeOnly 'ai.pipestream.search:tei-provider'
+    // Mode-A ingest: server-side chunking (sentence-packed rules-v1, plus
+    // OpenNLP model-pinned boundaries via the preview fork)
+    implementation 'ai.pipestream.search:chunker-spi'
+    runtimeOnly 'ai.pipestream.search:chunker-sentence'
+    implementation 'ai.pipestream.search:nlp'
+    // ProtoMolt index SPI: BlockJoinLuceneMapper registers the block-join
+    // block builder as the "distributed-lucene" engine, delegating flat field
+    // mapping to ProtoLuceneMapper. The snapshots depend on the same fork
+    // Lucene GAV as this build, so no second Lucene lineage enters the
+    // classpath.
+    def protomoltVersion = '0.1.0-SNAPSHOT'
+    implementation "ai.pipestream:protomolt-index-spi:${protomoltVersion}"
+    implementation "ai.pipestream:protomolt-index-lucene:${protomoltVersion}"
     testImplementation 'io.quarkus:quarkus-junit'
     testImplementation 'io.rest-assured:rest-assured'
 }

@@ -18,5 +18,8 @@ includeBuild('../embeddings') {
     dependencySubstitution {
         substitute module('ai.pipestream.search:embeddings-spi') using project(':embeddings-spi')
         substitute module('ai.pipestream.search:tei-provider') using project(':tei-provider')
+        substitute module('ai.pipestream.search:chunker-spi') using project(':chunker-spi')
+        substitute module('ai.pipestream.search:chunker-sentence') using project(':chunker-sentence')
+        substitute module('ai.pipestream.search:nlp') using project(':nlp')
     }
 }
