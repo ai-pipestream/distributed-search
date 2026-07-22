@@ -7,9 +7,11 @@ import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexNotFoundException;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.FSDirectory;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
@@ -17,7 +19,9 @@ import org.jboss.logging.Logger;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
@@ -105,7 +109,7 @@ public class CollectionManager {
         return configs.values();
     }
 
-    public boolean deleteCollection(String name) throws IOException {
+    public synchronized boolean deleteCollection(String name) throws IOException {
         CollectionConfig config = configs.remove(name);
         if (config == null) {
             return false;
@@ -135,41 +139,57 @@ public class CollectionManager {
         return true;
     }
 
-    public IndexWriter getWriter(String collection, int shardId) throws IOException {
+    public synchronized IndexWriter getWriter(String collection, int shardId) throws IOException {
         String key = writerKey(collection, shardId);
         IndexWriter existing = writers.get(key);
         if (existing != null && existing.isOpen()) {
             return existing;
         }
+        if (!configs.containsKey(collection)) {
+            throw new IOException("Unknown collection: " + collection);
+        }
 
-        return writers.compute(key, (k, w) -> {
-            if (w != null && w.isOpen()) return w;
-            try {
-                Path dir = shardDir(collection, shardId);
-                Files.createDirectories(dir);
-                FSDirectory fsDir = FSDirectory.open(dir);
-                IndexWriterConfig iwc = new IndexWriterConfig();
-                return new IndexWriter(fsDir, iwc);
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to open IndexWriter for " + k, e);
-            }
-        });
+        Path dir = shardDir(collection, shardId);
+        Files.createDirectories(dir);
+        FSDirectory fsDir = FSDirectory.open(dir);
+        IndexWriterConfig iwc = new IndexWriterConfig();
+        IndexWriter writer = new IndexWriter(fsDir, iwc);
+        writers.put(key, writer);
+        return writer;
     }
 
+    /**
+     * Returns an incRef'd NRT reader for the shard. Throws
+     * {@link IndexNotFoundException} for a shard that exists but has never
+     * been written to (callers treat that as an empty shard, not an error).
+     */
     public synchronized DirectoryReader getReader(String collection, int shardId) throws IOException {
         String key = writerKey(collection, shardId);
 
         DirectoryReader currentReader = readers.get(key);
         if (currentReader != null) {
-            DirectoryReader newReader = DirectoryReader.openIfChanged(currentReader);
-            if (newReader != null) {
-                readers.put(key, newReader);
-                currentReader.close();
-                newReader.incRef();
-                return newReader;
+            try {
+                DirectoryReader newReader = DirectoryReader.openIfChanged(currentReader);
+                if (newReader != null) {
+                    readers.put(key, newReader);
+                    currentReader.close();
+                    newReader.incRef();
+                    return newReader;
+                }
+                currentReader.incRef();
+                return currentReader;
+            } catch (AlreadyClosedException | IOException e) {
+                // A reader opened from a writer that has since been closed (e.g.
+                // by a tragic event) fails refresh forever. Evict and reopen cold
+                // instead of poisoning the cache permanently.
+                LOG.warnf(e, "Cached reader for %s is stale; evicting and reopening", key);
+                readers.remove(key);
+                try {
+                    currentReader.close();
+                } catch (Exception suppressed) {
+                    LOG.debugf(suppressed, "Error closing stale reader for %s", key);
+                }
             }
-            currentReader.incRef();
-            return currentReader;
         }
 
         IndexWriter writer = writers.get(key);
@@ -179,9 +199,15 @@ public class CollectionManager {
         } else {
             Path dir = shardDir(collection, shardId);
             if (!Files.exists(dir)) {
-                throw new IOException("Shard directory does not exist: " + dir);
+                throw new IndexNotFoundException("Shard directory does not exist: " + dir);
             }
-            reader = DirectoryReader.open(FSDirectory.open(dir));
+            FSDirectory fsDir = FSDirectory.open(dir);
+            if (!DirectoryReader.indexExists(fsDir)) {
+                // Created but never written: an empty shard, not an error state.
+                fsDir.close();
+                throw new IndexNotFoundException("No commit in shard directory: " + dir);
+            }
+            reader = DirectoryReader.open(fsDir);
         }
         readers.put(key, reader);
         reader.incRef();
@@ -235,15 +261,52 @@ public class CollectionManager {
         }
     }
 
+    /**
+     * Commits every open writer of one collection, reporting failures instead
+     * of swallowing them. This is the durability path behind FlushAck: a flush
+     * acknowledgement must never be sent when a covering commit failed.
+     *
+     * @throws IOException naming every shard whose commit failed
+     */
+    public void commitCollection(String collection) throws IOException {
+        CollectionConfig config = configs.get(collection);
+        if (config == null) {
+            throw new IOException("Unknown collection: " + collection);
+        }
+        List<String> failures = new ArrayList<>();
+        for (int i = 0; i < config.numShards(); i++) {
+            IndexWriter writer = writers.get(writerKey(collection, i));
+            if (writer == null) {
+                continue;
+            }
+            try {
+                if (writer.hasUncommittedChanges()) {
+                    writer.commit();
+                }
+            } catch (Throwable t) {
+                // AlreadyClosedException (tragic event) is unchecked; catch it too.
+                LOG.errorf(t, "Commit failed for %s/shard-%d", collection, i);
+                failures.add("shard-" + i + ": " + t);
+            }
+        }
+        if (!failures.isEmpty()) {
+            throw new IOException("Commit failed for collection '" + collection + "': "
+                    + String.join("; ", failures));
+        }
+    }
+
     @Scheduled(every = "5s")
     public void periodicCommit() {
         writers.forEach((key, writer) -> {
-            if (writer.isOpen() && writer.hasUncommittedChanges()) {
-                try {
+            try {
+                if (writer.isOpen() && writer.hasUncommittedChanges()) {
                     writer.commit();
-                } catch (IOException e) {
-                    LOG.warnf(e, "Periodic commit failed for %s", key);
                 }
+            } catch (Throwable t) {
+                // Catch everything: an AlreadyClosedException (isOpen() is a
+                // TOCTOU check) would otherwise abort the whole forEach pass and
+                // leave the remaining writers uncommitted.
+                LOG.warnf(t, "Periodic commit failed for %s", key);
             }
         });
     }
@@ -252,7 +315,7 @@ public class CollectionManager {
         close();
     }
 
-    public void close() {
+    public synchronized void close() {
         writers.forEach((key, writer) -> closeWriter(key));
         readers.forEach((key, reader) -> closeReader(key));
     }

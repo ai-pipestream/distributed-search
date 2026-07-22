@@ -43,45 +43,61 @@ public class V1Alpha1SearchNodeService implements SearchService {
     @Inject
     jakarta.enterprise.inject.Instance<MeterRegistry> meterRegistry;
 
+    /** Upper bound on the per-request result window. */
+    @org.eclipse.microprofile.config.inject.ConfigProperty(name = "knn.v1alpha1.max-size", defaultValue = "1000")
+    int maxSize;
+
+    /** One merged hit: client doc id + score + owning shard. */
+    record GlobalHit(String docId, float score, int shardId) {}
+
     @Override
     public Multi<SearchResponse> search(SearchRequest request) {
         return Multi.createFrom().<SearchResponse>emitter(emitter -> {
             String queryId = UUID.randomUUID().toString();
             long startTime = System.currentTimeMillis();
 
-            if (meterRegistry.isResolvable()) {
-                meterRegistry.get().counter("knn.v1alpha1.search.requests", "collection", request.getCollection()).increment();
-            }
-
-            // Frame 1: SearchContext (always emitted first)
-            SearchContext context = SearchContext.newBuilder()
-                    .setQueryId(queryId)
-                    .build();
-            emitter.emit(SearchResponse.newBuilder().setContext(context).build());
-
             String collectionName = request.getCollection();
             if (collectionName.isEmpty()) {
-                emitter.fail(new IllegalArgumentException("Collection name must not be empty"));
+                emitter.fail(io.grpc.Status.INVALID_ARGUMENT
+                        .withDescription("Collection name must not be empty")
+                        .asRuntimeException());
                 return;
             }
 
             CollectionConfig config = collectionManager.getConfig(collectionName);
             if (config == null) {
-                emitter.fail(new IllegalArgumentException("Collection not found: " + collectionName));
+                emitter.fail(io.grpc.Status.NOT_FOUND
+                        .withDescription("Collection not found: " + collectionName)
+                        .asRuntimeException());
                 return;
             }
 
+            // Tag with the collection name only after it is known to exist:
+            // unbounded caller-supplied tag values are a meter-cardinality leak.
+            if (meterRegistry.isResolvable()) {
+                meterRegistry.get().counter("knn.v1alpha1.search.requests", "collection", collectionName).increment();
+            }
+
+            // Frame 1: SearchContext (always emitted first on the success path)
+            emitter.emit(SearchResponse.newBuilder()
+                    .setContext(SearchContext.newBuilder().setQueryId(queryId).build())
+                    .build());
+
             CollectionSchema schema = toProtoSchema(config);
-            int targetSize = request.getSize() > 0 ? request.getSize() : 10;
+            int targetSize = request.getSize() > 0 ? Math.min(request.getSize(), maxSize) : 10;
 
             try {
                 // Compile the v1alpha1 query AST
                 QueryPlan plan = queryCompiler.compile(request.getQuery(), schema);
 
                 List<ShardSummary> shardSummaries = new ArrayList<>();
-                List<ScoreDoc> globalHits = new ArrayList<>();
-                long totalVisited = 0;
+                List<GlobalHit> globalHits = new ArrayList<>();
+                long totalHits = 0;
+                boolean totalHitsExact = true;
+                int failedShards = 0;
+                List<String> shardErrors = new ArrayList<>();
                 float kthBestFloor = Float.NEGATIVE_INFINITY;
+                int position = 1;
 
                 for (int shardId = 0; shardId < config.numShards(); shardId++) {
                     if (emitter.isCancelled()) {
@@ -92,21 +108,36 @@ public class V1Alpha1SearchNodeService implements SearchService {
                     long shardStart = System.currentTimeMillis();
                     DirectoryReader reader = null;
                     try {
-                        reader = collectionManager.getReader(collectionName, shardId);
+                        try {
+                            reader = collectionManager.getReader(collectionName, shardId);
+                        } catch (org.apache.lucene.index.IndexNotFoundException e) {
+                            // Created-but-never-written shard: an empty shard,
+                            // not a failure.
+                            shardSummaries.add(ShardSummary.newBuilder()
+                                    .setShardId(shardId)
+                                    .setTookMs(System.currentTimeMillis() - shardStart)
+                                    .setStatus(com.google.rpc.Status.newBuilder().setCode(0).build())
+                                    .build());
+                            continue;
+                        }
                         IndexSearcher searcher = new IndexSearcher(reader);
                         TopDocs topDocs = hybridExecutor.execute(plan, searcher, targetSize);
 
+                        totalHits += topDocs.totalHits.value();
+                        if (topDocs.totalHits.relation() != org.apache.lucene.search.TotalHits.Relation.EQUAL_TO) {
+                            totalHitsExact = false;
+                        }
+
                         StoredFields storedFields = reader.storedFields();
-                        int position = 1;
                         for (ScoreDoc sd : topDocs.scoreDocs) {
                             if (emitter.isCancelled()) break;
-                            globalHits.add(sd);
 
                             Document doc = storedFields.document(sd.doc);
                             String docId = doc.get("doc_id");
                             if (docId == null) {
                                 docId = String.valueOf(sd.doc);
                             }
+                            globalHits.add(new GlobalHit(docId, sd.score, shardId));
 
                             Hit.Builder hitBuilder = Hit.newBuilder()
                                     .setDocId(docId)
@@ -140,17 +171,19 @@ public class V1Alpha1SearchNodeService implements SearchService {
 
                         shardSummaries.add(ShardSummary.newBuilder()
                                 .setShardId(shardId)
-                                .setVisited(topDocs.scoreDocs.length)
                                 .setTookMs(System.currentTimeMillis() - shardStart)
                                 .setStatus(com.google.rpc.Status.newBuilder().setCode(0).build())
                                 .build());
 
                     } catch (Exception e) {
                         LOG.errorf(e, "Error searching shard %d for collection %s", shardId, collectionName);
+                        failedShards++;
+                        String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                        shardErrors.add("shard " + shardId + ": " + message);
                         shardSummaries.add(ShardSummary.newBuilder()
                                 .setShardId(shardId)
                                 .setTookMs(System.currentTimeMillis() - shardStart)
-                                .setStatus(com.google.rpc.Status.newBuilder().setCode(13).setMessage(e.getMessage()).build())
+                                .setStatus(com.google.rpc.Status.newBuilder().setCode(13).setMessage(message).build())
                                 .build());
                     } finally {
                         if (reader != null) {
@@ -159,23 +192,36 @@ public class V1Alpha1SearchNodeService implements SearchService {
                     }
                 }
 
+                // Every shard failed: that is an RPC-level failure, never an
+                // OK stream with an empty Summary.
+                if (failedShards > 0 && failedShards == config.numShards()) {
+                    emitter.fail(io.grpc.Status.UNAVAILABLE
+                            .withDescription("All " + failedShards + " shards failed: "
+                                    + String.join("; ", shardErrors))
+                            .asRuntimeException());
+                    return;
+                }
+
                 // Rank top hits globally
-                globalHits.sort((a, b) -> Float.compare(b.score, a.score));
+                globalHits.sort((a, b) -> Float.compare(b.score(), a.score()));
 
                 List<String> topDocIds = new ArrayList<>();
                 for (int i = 0; i < Math.min(targetSize, globalHits.size()); i++) {
-                    topDocIds.add(String.valueOf(globalHits.get(i).doc));
+                    topDocIds.add(globalHits.get(i).docId());
                 }
 
                 long tookMs = System.currentTimeMillis() - startTime;
 
-                // Final frame: Summary
+                // Final frame: Summary. `visited` stays 0 (unknown) until the
+                // collector managers thread real visit counts through — a
+                // plausible-looking wrong number is worse than an honest zero.
                 Summary summary = Summary.newBuilder()
                         .setQueryId(queryId)
                         .addAllTopDocIds(topDocIds)
-                        .setTotalHits(globalHits.size())
-                        .setTotalHitsRelation(TotalHitsRelation.TOTAL_HITS_RELATION_EQ)
-                        .setVisited(totalVisited > 0 ? totalVisited : globalHits.size())
+                        .setTotalHits(totalHits)
+                        .setTotalHitsRelation(totalHitsExact && failedShards == 0
+                                ? TotalHitsRelation.TOTAL_HITS_RELATION_EQ
+                                : TotalHitsRelation.TOTAL_HITS_RELATION_GTE)
                         .setTookMs(tookMs)
                         .setKthBestFloor(kthBestFloor)
                         .setTerminatedBy(TerminationReason.TERMINATION_REASON_COMPLETE)
@@ -198,20 +244,29 @@ public class V1Alpha1SearchNodeService implements SearchService {
             String collectionName = request.getCollection();
             CollectionConfig config = collectionManager.getConfig(collectionName);
             if (config == null) {
-                throw new IllegalArgumentException("Collection not found: " + collectionName);
+                throw io.grpc.Status.NOT_FOUND
+                        .withDescription("Collection not found: " + collectionName)
+                        .asRuntimeException();
             }
 
             CollectionSchema schema = toProtoSchema(config);
             QueryPlan plan = queryCompiler.compile(request.getQuery(), schema);
 
             if (!(plan instanceof QueryPlan.Single single)) {
-                throw new IllegalArgumentException("Explain currently supports single queries");
+                throw io.grpc.Status.INVALID_ARGUMENT
+                        .withDescription("Explain currently supports single queries")
+                        .asRuntimeException();
             }
 
             int shardId = collectionManager.routeToShard(request.getDocId(), config.numShards());
             DirectoryReader reader = null;
             try {
-                reader = collectionManager.getReader(collectionName, shardId);
+                try {
+                    reader = collectionManager.getReader(collectionName, shardId);
+                } catch (org.apache.lucene.index.IndexNotFoundException e) {
+                    // Empty shard: the document does not exist there.
+                    return ExplainResponse.newBuilder().setMatched(false).build();
+                }
                 IndexSearcher searcher = new IndexSearcher(reader);
 
                 TopDocs topDocs = searcher.search(new org.apache.lucene.search.TermQuery(new org.apache.lucene.index.Term("doc_id", request.getDocId())), 1);

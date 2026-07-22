@@ -56,7 +56,6 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
                         break;
                     }
                 }
-                registeredSchemas.put(name, schema);
             }
 
             int numShards = request.getNumShards() > 0 ? request.getNumShards() : 1;
@@ -65,9 +64,16 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
                 CollectionConfig config = collectionManager.createCollection(
                         name, vectorDimension, similarity, numShards, ""
                 );
+                // Register the schema only after the create succeeded: a failed
+                // create must never replace an existing collection's schema.
+                if (request.hasSchema()) {
+                    registeredSchemas.putIfAbsent(name, request.getSchema());
+                }
                 return CreateCollectionResponse.newBuilder()
                         .setCollection(toProtoCollection(config, registeredSchemas.get(name)))
                         .build();
+            } catch (IllegalArgumentException e) {
+                throw io.grpc.Status.ALREADY_EXISTS.withDescription(e.getMessage()).asRuntimeException();
             } catch (Exception e) {
                 LOG.errorf(e, "Failed to create collection %s", name);
                 throw new RuntimeException(e);
@@ -78,17 +84,21 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
     @Override
     public Uni<DropCollectionResponse> dropCollection(DropCollectionRequest request) {
         return Uni.createFrom().item(() -> {
+            boolean deleted;
             try {
-                boolean deleted = collectionManager.deleteCollection(request.getName());
-                if (!deleted) {
-                    throw new IllegalArgumentException("Collection not found: " + request.getName());
-                }
-                registeredSchemas.remove(request.getName());
-                return DropCollectionResponse.newBuilder().build();
+                deleted = collectionManager.deleteCollection(request.getName());
             } catch (Exception e) {
                 LOG.errorf(e, "Failed to drop collection %s", request.getName());
                 throw new RuntimeException(e);
             }
+            if (!deleted) {
+                // Expected outcome, not an ERROR-with-stack-trace event.
+                throw io.grpc.Status.NOT_FOUND
+                        .withDescription("Collection not found: " + request.getName())
+                        .asRuntimeException();
+            }
+            registeredSchemas.remove(request.getName());
+            return DropCollectionResponse.newBuilder().build();
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
@@ -97,12 +107,16 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
         return Uni.createFrom().item(() -> {
             CollectionConfig config = collectionManager.getConfig(request.getName());
             if (config == null) {
-                throw new IllegalArgumentException("Collection not found: " + request.getName());
+                throw io.grpc.Status.NOT_FOUND
+                        .withDescription("Collection not found: " + request.getName())
+                        .asRuntimeException();
             }
             return GetCollectionResponse.newBuilder()
                     .setCollection(toProtoCollection(config, registeredSchemas.get(request.getName())))
                     .build();
-        });
+            // getDocStats() behind toProtoCollection can block on merges —
+            // keep this off the gRPC event loop.
+        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
     @Override
@@ -113,7 +127,7 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
                 builder.addCollections(toProtoCollection(config, registeredSchemas.get(config.name())));
             }
             return builder.build();
-        });
+        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
     @Override
@@ -133,20 +147,47 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
         });
     }
 
+    /**
+     * Re-parses the submitted descriptor set with the schema-options extension
+     * registry. gRPC decodes nested messages with protobuf's EMPTY registry,
+     * so without this step every (ai.pipestream.search.v1alpha1.field)
+     * annotation arrives as an unknown field and the schema silently compiles
+     * to zero fields — the trap documented on SchemaCompiler.parseDescriptorSet.
+     */
+    private static SchemaCompiler.Result compileSource(SchemaSource source) throws Exception {
+        com.google.protobuf.DescriptorProtos.FileDescriptorSet reparsed =
+                SchemaCompiler.parseDescriptorSet(source.getDescriptorSet().toByteArray());
+        return SchemaCompiler.compile(reparsed, source.getRootMessage());
+    }
+
     @Override
     public Uni<RegisterSchemaResponse> registerSchema(RegisterSchemaRequest request) {
         return Uni.createFrom().item(() -> {
             CollectionConfig config = collectionManager.getConfig(request.getCollection());
             if (config == null) {
-                throw new IllegalArgumentException("Collection not found: " + request.getCollection());
+                throw io.grpc.Status.NOT_FOUND
+                        .withDescription("Collection not found: " + request.getCollection())
+                        .asRuntimeException();
             }
 
             try {
-                SchemaCompiler.Result result = SchemaCompiler.compile(
-                        request.getSource().getDescriptorSet(),
-                        request.getSource().getRootMessage()
-                );
+                SchemaCompiler.Result result = compileSource(request.getSource());
+                if (!result.rejections().isEmpty()) {
+                    // The compiler drops rejected fields rather than throwing;
+                    // registering the survivors as a complete success would
+                    // green-light a schema the caller thinks is fully live.
+                    throw io.grpc.Status.INVALID_ARGUMENT
+                            .withDescription("Schema rejected: " + describeChanges(result.rejections()))
+                            .asRuntimeException();
+                }
                 CompiledSchema compiled = result.schema();
+                if (compiled.fields().isEmpty()) {
+                    throw io.grpc.Status.INVALID_ARGUMENT
+                            .withDescription("Schema compiled to zero indexable fields; "
+                                    + "check that the descriptor set carries "
+                                    + "(ai.pipestream.search.v1alpha1.field) annotations")
+                            .asRuntimeException();
+                }
                 CollectionSchema protoSchema = compiled.toProto();
                 registeredSchemas.put(request.getCollection(), protoSchema);
 
@@ -160,35 +201,47 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
                                 .setDescription("Successfully registered schema from proto source")
                                 .build())
                         .build();
+            } catch (io.grpc.StatusRuntimeException e) {
+                throw e;
             } catch (Exception e) {
                 LOG.errorf(e, "Failed to register schema for %s", request.getCollection());
-                throw new RuntimeException(e);
+                throw io.grpc.Status.INVALID_ARGUMENT
+                        .withDescription("Schema compilation failed: " + e.getMessage())
+                        .asRuntimeException();
             }
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+    }
+
+    private static String describeChanges(List<SchemaChange> changes) {
+        StringBuilder sb = new StringBuilder();
+        for (SchemaChange change : changes) {
+            if (sb.length() > 0) {
+                sb.append("; ");
+            }
+            sb.append(change.getField()).append(": ").append(change.getCode());
+        }
+        return sb.toString();
     }
 
     @Override
     public Uni<ValidateSchemaResponse> validateSchema(ValidateSchemaRequest request) {
         return Uni.createFrom().item(() -> {
             try {
-                SchemaCompiler.Result res = SchemaCompiler.compile(
-                        request.getSource().getDescriptorSet(),
-                        request.getSource().getRootMessage()
-                );
+                SchemaCompiler.Result res = compileSource(request.getSource());
                 CompiledSchema proposed = res.schema();
                 CollectionSchema protoSchema = proposed.toProto();
 
-                CollectionSchema currentProto = registeredSchemas.get(request.getCollection());
-                List<SchemaChange> changes = new ArrayList<>();
-
-                if (currentProto != null) {
-                    changes.addAll(res.rejections());
-                } else {
+                // Rejections are always reported — hiding them for collections
+                // without a registered schema inverts the CI gate this RPC
+                // exists to provide.
+                List<SchemaChange> changes = new ArrayList<>(res.rejections());
+                if (changes.isEmpty()) {
                     changes.add(SchemaChange.newBuilder()
                             .setClassification(SchemaChange.Classification.CLASSIFICATION_WIRE_SAFE_LIVE)
                             .setField("")
-                            .setCode("NEW_SCHEMA")
-                            .setDescription("Dry-run compilation succeeded for new collection schema")
+                            .setCode(registeredSchemas.containsKey(request.getCollection())
+                                    ? "SCHEMA_OK" : "NEW_SCHEMA")
+                            .setDescription("Dry-run compilation succeeded")
                             .build());
                 }
 
@@ -198,9 +251,11 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
                         .build();
             } catch (Exception e) {
                 LOG.errorf(e, "Validation failed for collection %s", request.getCollection());
-                throw new RuntimeException(e);
+                throw io.grpc.Status.INVALID_ARGUMENT
+                        .withDescription("Schema validation failed: " + e.getMessage())
+                        .asRuntimeException();
             }
-        });
+        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
     @Override
@@ -267,6 +322,15 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
         });
     }
 
+    private static VectorSimilarity toProtoSimilarity(VectorSimilarityFunction sim) {
+        return switch (sim) {
+            case COSINE -> VectorSimilarity.VECTOR_SIMILARITY_COSINE;
+            case DOT_PRODUCT -> VectorSimilarity.VECTOR_SIMILARITY_DOT_PRODUCT;
+            case EUCLIDEAN -> VectorSimilarity.VECTOR_SIMILARITY_EUCLIDEAN;
+            case MAXIMUM_INNER_PRODUCT -> VectorSimilarity.VECTOR_SIMILARITY_MAX_INNER_PRODUCT;
+        };
+    }
+
     private Collection toProtoCollection(CollectionConfig config, CollectionSchema schema) {
         Collection.Builder builder = Collection.newBuilder()
                 .setName(config.name())
@@ -284,6 +348,7 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
                             .setName("vector")
                             .setDenseVector(DenseVectorFieldSchema.newBuilder()
                                     .setDims(config.vectorDimension())
+                                    .setSimilarity(toProtoSimilarity(config.similarity()))
                                     .build())
                             .build())
                     .build());
