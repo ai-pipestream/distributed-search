@@ -95,13 +95,32 @@ public class ParentDocumentProjector {
     }
 
     /**
-     * Chunk child document: identity + vector + stored payload/offsets.
+     * The first string value at a dotted path of the parent payload — the
+     * chunk source for mode-A (server chunking) ingest.
+     */
+    public java.util.Optional<String> extractText(SchemaStore.StoredSchema schema,
+                                                  Any payload, String dottedPath) {
+        Message message = unpack(schema, schema.rootMessage(), payload);
+        for (Object value : extract(message, dottedPath)) {
+            if (value instanceof String s && !s.isEmpty()) {
+                return java.util.Optional.of(s);
+            }
+        }
+        return java.util.Optional.empty();
+    }
+
+    /**
+     * Chunk child document: identity + vector + stored payload/offsets, plus
+     * opt-in stored chunk text (mode A with store_chunk_text).
      * doc_id and _gen are added by {@link BlockJoinDocumentBuilder}.
      */
     public Document projectChunk(SchemaStore.StoredSchema schema, CollectionConfig config,
-                                 Chunk chunk, int ordinal, String chunkId) {
+                                 Chunk chunk, int ordinal, String chunkId, String chunkText) {
         Document doc = new Document();
         doc.add(new StringField(BlockJoinFields.CHUNK_ID, chunkId, Field.Store.YES));
+        if (chunkText != null && !chunkText.isEmpty()) {
+            doc.add(new StoredField(BlockJoinFields.CHUNK_TEXT, chunkText));
+        }
         doc.add(new StoredField(BlockJoinFields.CHUNK_ORD, ordinal));
         doc.add(new NumericDocValuesField(BlockJoinFields.CHUNK_ORD, ordinal));
         doc.add(new StoredField(BlockJoinFields.CHUNK_START, chunk.getStartOffset()));

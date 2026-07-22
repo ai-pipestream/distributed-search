@@ -421,45 +421,49 @@ public class V1Alpha1IndexNodeService implements IndexService {
             return Uni.createFrom().item(parentNack(seq, "", CODE_INVALID_ARGUMENT,
                     "IndexParentDocument.doc_id is required"));
         }
-        if (req.getModeCase() == IndexParentDocument.ModeCase.SERVER_CHUNKING) {
-            return Uni.createFrom().item(parentNack(seq, docId, CODE_UNIMPLEMENTED,
-                    "Server-side chunking (mode A) is not implemented yet; send supplied_chunks"));
-        }
-        if (req.getModeCase() != IndexParentDocument.ModeCase.SUPPLIED_CHUNKS) {
+        boolean modeA = req.getModeCase() == IndexParentDocument.ModeCase.SERVER_CHUNKING;
+        if (!modeA && req.getModeCase() != IndexParentDocument.ModeCase.SUPPLIED_CHUNKS) {
             return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
                     "One of server_chunking / supplied_chunks must be set"));
-        }
-        SuppliedChunks supplied = req.getSuppliedChunks();
-        if (supplied.getChunksCount() == 0) {
-            return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
-                    "supplied_chunks.chunks must not be empty"));
-        }
-        int cap = req.getPolicy().getMaxChunks() > 0
-                ? Math.min(req.getPolicy().getMaxChunks(), config.maxChunksPerDocument())
-                : config.maxChunksPerDocument();
-        if (supplied.getChunksCount() > cap) {
-            return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
-                    "Parent has " + supplied.getChunksCount() + " chunks; the cap is " + cap));
-        }
-        boolean anyMissingVector = supplied.getChunksList().stream().anyMatch(c -> !c.hasVector());
-        if (anyMissingVector && supplied.getEmbedMissingVectors()) {
-            return Uni.createFrom().item(parentNack(seq, docId, CODE_UNIMPLEMENTED,
-                    "embed_missing_vectors requires server-side embedding, which is not implemented yet"));
-        }
-        if (anyMissingVector) {
-            return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
-                    "Every chunk needs a vector (or set embed_missing_vectors)"));
         }
         if (!req.hasPayload() || req.getPayload().getTypeUrl().isEmpty()) {
             return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
                     "IndexParentDocument.payload (the pinned root message, in an Any) is required"));
         }
 
-        int[] ordinals = resolveOrdinals(supplied);
-        if (ordinals == null) {
-            return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
-                    "Chunk ordinals must be either all-implicit (all zero) or explicit and distinct"));
+        int cap = req.getPolicy().getMaxChunks() > 0
+                ? Math.min(req.getPolicy().getMaxChunks(), config.maxChunksPerDocument())
+                : config.maxChunksPerDocument();
+
+        SuppliedChunks supplied = null;
+        int[] ordinals = null;
+        if (!modeA) {
+            supplied = req.getSuppliedChunks();
+            if (supplied.getChunksCount() == 0) {
+                return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
+                        "supplied_chunks.chunks must not be empty"));
+            }
+            if (supplied.getChunksCount() > cap) {
+                return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
+                        "Parent has " + supplied.getChunksCount() + " chunks; the cap is " + cap));
+            }
+            boolean anyMissingVector = supplied.getChunksList().stream().anyMatch(c -> !c.hasVector());
+            if (anyMissingVector && supplied.getEmbedMissingVectors()) {
+                return Uni.createFrom().item(parentNack(seq, docId, CODE_UNIMPLEMENTED,
+                        "embed_missing_vectors: use server_chunking, or supply every vector"));
+            }
+            if (anyMissingVector) {
+                return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
+                        "Every chunk needs a vector (or set embed_missing_vectors)"));
+            }
+            ordinals = resolveOrdinals(supplied);
+            if (ordinals == null) {
+                return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
+                        "Chunk ordinals must be either all-implicit (all zero) or explicit and distinct"));
+            }
         }
+        final SuppliedChunks suppliedFinal = supplied;
+        final int[] ordinalsFinal = ordinals;
 
         IndexPolicy.Placement placement = effectivePlacement(session, config, req);
         if (placement == IndexPolicy.Placement.PLACEMENT_CONTIGUOUS) {
@@ -472,21 +476,183 @@ public class V1Alpha1IndexNodeService implements IndexService {
                         "Balanced placement across remote shard owners is not supported yet"));
             }
             return Uni.createFrom()
-                    .item(() -> writeParentBalanced(session, config, collectionName, docId,
-                            req, supplied, ordinals))
+                    .item(() -> {
+                        PreparedChunks prepared = prepare(session, config, collectionName,
+                                docId, req, suppliedFinal, ordinalsFinal, cap, modeA);
+                        if (prepared.nack != null) {
+                            return prepared.nack;
+                        }
+                        return writeParentBalanced(session, config, collectionName, docId,
+                                req, prepared.chunks, prepared.ordinals, prepared.texts);
+                    })
                     .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
         }
 
         ShardRouter.Route route = shardRouter.route(collectionName, config.numShards(), docId);
         return switch (route.target()) {
             case LOCAL -> Uni.createFrom()
-                    .item(() -> writeParentLocal(session, config, collectionName, docId, req,
-                            supplied, ordinals, route.shardId()))
+                    .item(() -> {
+                        PreparedChunks prepared = prepare(session, config, collectionName,
+                                docId, req, suppliedFinal, ordinalsFinal, cap, modeA);
+                        if (prepared.nack != null) {
+                            return prepared.nack;
+                        }
+                        return writeParentLocal(session, config, collectionName, docId, req,
+                                prepared.chunks, prepared.ordinals, prepared.texts, route.shardId());
+                    })
                     .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
             case REMOTE -> forwardParent(session, route, collectionName, req);
             case NO_OWNER -> Uni.createFrom().item(parentNack(seq, docId, CODE_UNAVAILABLE,
                     "No primary owner is available for shard " + route.shardId()));
         };
+    }
+
+    /** Effective chunk set: pass-through for mode B, chunk+embed for mode A. */
+    private record PreparedChunks(SuppliedChunks chunks, int[] ordinals,
+                                  Map<Integer, String> texts, BulkIndexResponse nack) {}
+
+    /** Cached embedding providers, keyed by model (forModel re-runs ServiceLoader). */
+    private final Map<String, ai.pipestream.search.embeddings.EmbeddingProvider>
+            embeddingProviders = new ConcurrentHashMap<>();
+
+    private PreparedChunks prepare(BulkSession session, CollectionConfig config,
+                                   String collectionName, String docId,
+                                   IndexParentDocument req, SuppliedChunks supplied,
+                                   int[] ordinals, int cap, boolean modeA) {
+        if (!modeA) {
+            return new PreparedChunks(supplied, ordinals, Map.of(), null);
+        }
+        long seq = req.getClientSeq();
+        try {
+            SchemaPin asserted = req.hasSchema() ? req.getSchema() : session.defaultSchema;
+            SchemaStore.StoredSchema schema = projector.resolvePinned(collectionName, asserted);
+
+            List<ai.pipestream.search.schema.DeriveSpec> specs = schema.deriveSpecs();
+            if (specs.isEmpty()) {
+                return new PreparedChunks(null, null, null, parentNack(seq, docId,
+                        CODE_FAILED_PRECONDITION,
+                        "The registered schema declares no derivable representation "
+                                + "(Representation.derive); use supplied_chunks"));
+            }
+            ServerChunking serverChunking = req.getServerChunking();
+            ai.pipestream.search.schema.DeriveSpec spec = null;
+            if (serverChunking.getRepresentation().isEmpty()) {
+                if (specs.size() > 1) {
+                    return new PreparedChunks(null, null, null, parentNack(seq, docId,
+                            CODE_INVALID_ARGUMENT, "The schema declares " + specs.size()
+                                    + " derivable representations; server_chunking.representation must select one"));
+                }
+                spec = specs.get(0);
+            } else {
+                for (ai.pipestream.search.schema.DeriveSpec candidate : specs) {
+                    if (candidate.representationName().equals(serverChunking.getRepresentation())
+                            || candidate.vectorField().equals(serverChunking.getRepresentation())) {
+                        spec = candidate;
+                        break;
+                    }
+                }
+                if (spec == null) {
+                    return new PreparedChunks(null, null, null, parentNack(seq, docId,
+                            CODE_INVALID_ARGUMENT, "No derivable representation named '"
+                                    + serverChunking.getRepresentation() + "'"));
+                }
+            }
+
+            String textPath = serverChunking.getTextFieldPath().isEmpty()
+                    ? spec.sourceField() : serverChunking.getTextFieldPath();
+            String text = projector.extractText(schema, req.getPayload(), textPath).orElse(null);
+            if (text == null) {
+                return new PreparedChunks(null, null, null, parentNack(seq, docId,
+                        CODE_INVALID_ARGUMENT, "Payload has no text at '" + textPath + "'"));
+            }
+
+            ai.pipestream.search.v1alpha1.ChunkSpec protoSpec = spec.config().getSpec();
+            ai.pipestream.search.chunking.ChunkSpec chunkSpec =
+                    new ai.pipestream.search.chunking.ChunkSpec(
+                            protoSpec.getStrategy(), protoSpec.getTargetTokens(),
+                            protoSpec.getOverlapTokens(), protoSpec.getMinTokens(),
+                            protoSpec.getMaxTokens(), protoSpec.getTokenizer(),
+                            protoSpec.getBoundary(), protoSpec.getImplVersion()).resolved();
+            ai.pipestream.search.chunking.Chunker chunker =
+                    ai.pipestream.search.chunking.Chunkers.byName(chunkSpec.strategy());
+            List<ai.pipestream.search.chunking.Chunk> pieces = chunker.chunk(text, chunkSpec,
+                    new ai.pipestream.search.chunking.CharsPerTokenCounter());
+            if (pieces.isEmpty()) {
+                return new PreparedChunks(null, null, null, parentNack(seq, docId,
+                        CODE_INVALID_ARGUMENT, "Chunk source at '" + textPath
+                                + "' produced zero chunks"));
+            }
+            // Cap enforcement BEFORE embedding: a pathological document costs
+            // one chunking pass, not thousands of embed calls.
+            if (pieces.size() > cap) {
+                return new PreparedChunks(null, null, null, parentNack(seq, docId,
+                        CODE_INVALID_ARGUMENT, "Chunking produced " + pieces.size()
+                                + " chunks; the cap is " + cap));
+            }
+
+            String model = spec.config().getModel();
+            ai.pipestream.search.embeddings.EmbeddingProvider provider =
+                    embeddingProviders.computeIfAbsent(model,
+                            ai.pipestream.search.embeddings.EmbeddingProviders::forModel);
+            List<String> texts = pieces.stream()
+                    .map(ai.pipestream.search.chunking.Chunk::text).toList();
+            // One embed call per parent: the parent IS the natural batch.
+            List<float[]> vectors = provider.embed(model, texts);
+            if (vectors.size() != pieces.size()) {
+                return new PreparedChunks(null, null, null, parentNack(seq, docId, CODE_INTERNAL,
+                        "Provider returned " + vectors.size() + " vectors for "
+                                + pieces.size() + " chunks"));
+            }
+
+            SuppliedChunks.Builder chunks = SuppliedChunks.newBuilder();
+            Map<Integer, String> chunkTexts = new java.util.HashMap<>();
+            int[] modeAOrdinals = new int[pieces.size()];
+            for (int i = 0; i < pieces.size(); i++) {
+                float[] vector = vectors.get(i);
+                if (spec.config().getNormalize()) {
+                    normalizeInPlace(vector);
+                }
+                Vector.Builder vectorProto = Vector.newBuilder();
+                for (float f : vector) {
+                    vectorProto.addValues(f);
+                }
+                chunks.addChunks(Chunk.newBuilder()
+                        .setOrdinal(i)
+                        .setStartOffset(pieces.get(i).startOffset())
+                        .setEndOffset(pieces.get(i).endOffset())
+                        .setVector(vectorProto)
+                        .setVectorField(spec.vectorField())
+                        .build());
+                modeAOrdinals[i] = i;
+                if (spec.config().getStoreChunkText()) {
+                    chunkTexts.put(i, pieces.get(i).text());
+                }
+            }
+            return new PreparedChunks(chunks.build(), modeAOrdinals, chunkTexts, null);
+        } catch (ParentDocumentProjector.SchemaPinMismatchException e) {
+            return new PreparedChunks(null, null, null,
+                    parentNack(seq, docId, CODE_FAILED_PRECONDITION, e.getMessage()));
+        } catch (ParentDocumentProjector.InvalidPayloadException | IllegalArgumentException e) {
+            return new PreparedChunks(null, null, null,
+                    parentNack(seq, docId, CODE_INVALID_ARGUMENT, e.getMessage()));
+        } catch (Exception e) {
+            LOG.errorf(e, "Mode-A chunk/embed failed for %s", docId);
+            return new PreparedChunks(null, null, null,
+                    parentNack(seq, docId, CODE_INTERNAL, safeMessage(e)));
+        }
+    }
+
+    private static void normalizeInPlace(float[] vector) {
+        double norm = 0;
+        for (float f : vector) {
+            norm += (double) f * f;
+        }
+        if (norm > 0) {
+            float scale = (float) (1.0 / Math.sqrt(norm));
+            for (int i = 0; i < vector.length; i++) {
+                vector[i] *= scale;
+            }
+        }
     }
 
     /** Implicit (all zero → by position) or explicit distinct ordinals; null = invalid. */
@@ -543,7 +709,7 @@ public class V1Alpha1IndexNodeService implements IndexService {
     private BulkIndexResponse writeParentBalanced(BulkSession session, CollectionConfig config,
                                                   String collectionName, String docId,
                                                   IndexParentDocument req, SuppliedChunks supplied,
-                                                  int[] ordinals) {
+                                                  int[] ordinals, Map<Integer, String> chunkTexts) {
         long seq = req.getClientSeq();
         try {
             SchemaPin asserted = req.hasSchema() ? req.getSchema() : session.defaultSchema;
@@ -600,7 +766,8 @@ public class V1Alpha1IndexNodeService implements IndexService {
                     String chunkId = chunk.getChunkId().isEmpty()
                             ? docId + "#" + generation + "#" + ordinal
                             : chunk.getChunkId();
-                    children.add(projector.projectChunk(schema, config, chunk, ordinal, chunkId));
+                    children.add(projector.projectChunk(schema, config, chunk, ordinal, chunkId,
+                            chunkTexts.get(ordinal)));
                 }
                 Document stub = projector.projectParentStub(schema, req.getPayload());
                 blocksByShard.put(shardId, BlockJoinDocumentBuilder.build(
@@ -694,7 +861,8 @@ public class V1Alpha1IndexNodeService implements IndexService {
     private BulkIndexResponse writeParentLocal(BulkSession session, CollectionConfig config,
                                                String collectionName, String docId,
                                                IndexParentDocument req, SuppliedChunks supplied,
-                                               int[] ordinals, int shardId) {
+                                               int[] ordinals, Map<Integer, String> chunkTexts,
+                                               int shardId) {
         long seq = req.getClientSeq();
         try {
             SchemaPin asserted = req.hasSchema() ? req.getSchema() : session.defaultSchema;
@@ -719,7 +887,8 @@ public class V1Alpha1IndexNodeService implements IndexService {
                 String chunkId = chunk.getChunkId().isEmpty()
                         ? docId + "#" + generation + "#" + ordinals[idx]
                         : chunk.getChunkId();
-                children.add(projector.projectChunk(schema, config, chunk, ordinals[idx], chunkId));
+                children.add(projector.projectChunk(schema, config, chunk, ordinals[idx], chunkId,
+                        chunkTexts.get(ordinals[idx])));
             }
 
             List<Document> block = BlockJoinDocumentBuilder.build(

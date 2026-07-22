@@ -83,6 +83,9 @@ dependencies {
     // for ServiceLoader discovery.
     implementation 'ai.pipestream.search:embeddings-spi'
     runtimeOnly 'ai.pipestream.search:tei-provider'
+    // Mode-A ingest: server-side chunking (sentence-packed, rules-v1)
+    implementation 'ai.pipestream.search:chunker-spi'
+    runtimeOnly 'ai.pipestream.search:chunker-sentence'
     testImplementation 'io.quarkus:quarkus-junit'
     testImplementation 'io.rest-assured:rest-assured'
 }

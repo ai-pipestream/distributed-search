@@ -48,7 +48,8 @@ public class SchemaStore {
     public record StoredSchema(String rootMessage, String chunkMessage,
                                byte[] descriptorBytes, byte[] descriptorDigest,
                                byte[] planDigest, CompiledSchema compiled,
-                               Map<String, com.google.protobuf.Descriptors.Descriptor> messagePool) {
+                               Map<String, com.google.protobuf.Descriptors.Descriptor> messagePool,
+                               java.util.List<DeriveSpec> deriveSpecs) {
 
         public SchemaPin toPin() {
             return SchemaPin.newBuilder()
@@ -165,13 +166,34 @@ public class SchemaStore {
                     "chunk_message '" + chunkMessage + "' is not defined in the descriptor set");
         }
 
+        com.google.protobuf.Descriptors.Descriptor root = pool.get(rootMessage);
+        java.util.List<DeriveSpec> deriveSpecs = root == null
+                ? java.util.List.of() : DeriveSpec.resolve(root);
+
         byte[] descriptorDigest = sha256(descriptorBytes);
         // v1 plan canonicalization: the compiled schema's deterministic wire
-        // projection. The effective ChunkSpec folds in with mode-A ingest.
-        byte[] planDigest = sha256(result.schema().toProto().toByteArray());
+        // projection, plus every derivation config — changing the chunking
+        // or the model is a reindex, which no descriptor hash can answer.
+        java.io.ByteArrayOutputStream planBytes = new java.io.ByteArrayOutputStream();
+        planBytes.writeBytes(result.schema().toProto().toByteArray());
+        for (DeriveSpec spec : deriveSpecs) {
+            planBytes.writeBytes(spec.vectorField().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            planBytes.writeBytes(spec.config().toByteArray());
+        }
+        byte[] planDigest = sha256(planBytes.toByteArray());
         return new StoredSchema(rootMessage, chunkMessage == null ? "" : chunkMessage,
                 descriptorBytes, descriptorDigest, planDigest, result.schema(),
-                Map.copyOf(pool));
+                Map.copyOf(pool), deriveSpecs);
+    }
+
+    /**
+     * Compiles a submission WITHOUT persisting it — for pre-registration
+     * validation (derive model dims, provider availability) that must fail
+     * before anything reaches disk.
+     */
+    public static StoredSchema prepare(byte[] descriptorBytes, String rootMessage,
+                                       String chunkMessage) throws Exception {
+        return build(descriptorBytes, rootMessage, chunkMessage);
     }
 
     private static void collectMessages(java.util.List<com.google.protobuf.Descriptors.Descriptor> messages,

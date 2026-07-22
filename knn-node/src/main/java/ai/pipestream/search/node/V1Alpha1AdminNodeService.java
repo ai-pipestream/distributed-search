@@ -194,6 +194,53 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
                 }
 
                 String chunkMessage = request.getSource().getChunkMessage();
+
+                // Validate mode-A derivations BEFORE anything persists: a
+                // dims mismatch must fail at register, not as garbage at
+                // query; an unresolvable model or chunker must fail here too.
+                ai.pipestream.search.schema.SchemaStore.StoredSchema prepared;
+                try {
+                    prepared = ai.pipestream.search.schema.SchemaStore.prepare(
+                            request.getSource().getDescriptorSet().toByteArray(),
+                            request.getSource().getRootMessage(), chunkMessage);
+                } catch (IllegalArgumentException e) {
+                    throw io.grpc.Status.INVALID_ARGUMENT
+                            .withDescription(e.getMessage()).asRuntimeException();
+                }
+                for (ai.pipestream.search.schema.DeriveSpec derive : prepared.deriveSpecs()) {
+                    if (derive.config().getModel().isEmpty()) {
+                        throw io.grpc.Status.INVALID_ARGUMENT
+                                .withDescription("Derivation on '" + derive.vectorField()
+                                        + "' declares no embedding model")
+                                .asRuntimeException();
+                    }
+                    ai.pipestream.search.embeddings.EmbeddingProvider provider;
+                    try {
+                        provider = ai.pipestream.search.embeddings.EmbeddingProviders
+                                .forModel(derive.config().getModel());
+                    } catch (IllegalStateException e) {
+                        throw io.grpc.Status.INVALID_ARGUMENT
+                                .withDescription(e.getMessage()).asRuntimeException();
+                    }
+                    int modelDims = provider.dims(derive.config().getModel());
+                    if (modelDims != derive.vectorDims()) {
+                        throw io.grpc.Status.INVALID_ARGUMENT
+                                .withDescription("Derivation on '" + derive.vectorField()
+                                        + "': model '" + derive.config().getModel() + "' produces "
+                                        + modelDims + " dims but the representation declares "
+                                        + derive.vectorDims())
+                                .asRuntimeException();
+                    }
+                    String strategy = derive.config().getSpec().getStrategy();
+                    try {
+                        ai.pipestream.search.chunking.Chunkers.byName(
+                                strategy.isEmpty() ? "sentence-packed" : strategy);
+                    } catch (IllegalArgumentException e) {
+                        throw io.grpc.Status.INVALID_ARGUMENT
+                                .withDescription(e.getMessage()).asRuntimeException();
+                    }
+                }
+
                 if (!chunkMessage.isEmpty() && !config.documentCentric()) {
                     // A non-empty chunk_message declares a document-centric
                     // collection. The parent field is create-time-only in
