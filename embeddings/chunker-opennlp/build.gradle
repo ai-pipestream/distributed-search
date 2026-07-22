@@ -1,0 +1,8 @@
+dependencies {
+  api project(':chunker-spi')
+  // The ai.pipestream OpenNLP preview: sentence detection API + runtime
+  // (SentenceDetectorME, ThreadSafeSentenceDetectorME). Resolves from the
+  // snapshot repositories declared in the root build.
+  implementation 'ai.pipestream:opennlp-api:3.x-preview-SNAPSHOT'
+  implementation 'ai.pipestream:opennlp-runtime:3.x-preview-SNAPSHOT'
+}

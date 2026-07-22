@@ -94,9 +94,11 @@ dependencies {
     // for ServiceLoader discovery.
     implementation 'ai.pipestream.search:embeddings-spi'
     runtimeOnly 'ai.pipestream.search:tei-provider'
-    // Mode-A ingest: server-side chunking (sentence-packed, rules-v1)
+    // Mode-A ingest: server-side chunking (sentence-packed rules-v1, plus
+    // OpenNLP model-pinned boundaries via the preview fork)
     implementation 'ai.pipestream.search:chunker-spi'
     runtimeOnly 'ai.pipestream.search:chunker-sentence'
+    runtimeOnly 'ai.pipestream.search:chunker-opennlp'
     // ProtoMolt index SPI: BlockJoinLuceneMapper registers the block-join
     // block builder as the "distributed-lucene" engine, delegating flat field
     // mapping to ProtoLuceneMapper. The snapshots depend on the same fork

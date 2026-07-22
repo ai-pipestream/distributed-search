@@ -1,2 +1,2 @@
 rootProject.name = 'embeddings'
-include 'chunker-spi', 'chunker-sentence', 'embeddings-spi', 'model2vec-provider', 'kserve-provider', 'tei-provider', 'ovms-provider', 'equivalence-harness'
+include 'chunker-spi', 'chunker-sentence', 'chunker-opennlp', 'embeddings-spi', 'model2vec-provider', 'kserve-provider', 'tei-provider', 'ovms-provider', 'equivalence-harness'
