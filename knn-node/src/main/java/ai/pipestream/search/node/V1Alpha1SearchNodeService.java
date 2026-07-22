@@ -50,6 +50,14 @@ public class V1Alpha1SearchNodeService implements SearchService {
     @org.eclipse.microprofile.config.inject.ConfigProperty(name = "knn.v1alpha1.max-size", defaultValue = "1000")
     int maxSize;
 
+    /**
+     * Smallest k at which shared-floor pruning engages for collaborative
+     * document-centric queries; below it the search is exactly stock search
+     * (the fork's benchmarked default is 100).
+     */
+    @org.eclipse.microprofile.config.inject.ConfigProperty(name = "knn.v1alpha1.floor-activation-k", defaultValue = "100")
+    int floorActivationK;
+
     /** One merged hit: client doc id + score + owning shard. */
     record GlobalHit(String docId, float score, int shardId) {}
 
@@ -337,6 +345,15 @@ public class V1Alpha1SearchNodeService implements SearchService {
         org.apache.lucene.search.join.BitSetProducer parentsFilter =
                 collectionManager.getParentsFilter(collectionName);
 
+        // Collaborative traversal: one shared floor per query. Every shard's
+        // collectors prune against the best D parent scores seen so far, so
+        // later shards inherit the earlier shards' floor.
+        boolean collaborative = request.getQuery().getKnn().getCollaborative();
+        org.apache.lucene.sandbox.search.knn.GlobalKnnFloor floor = collaborative
+                ? new org.apache.lucene.sandbox.search.knn.GlobalKnnFloor(query.luceneK())
+                : null;
+        java.util.concurrent.atomic.AtomicLong visitedTotal = new java.util.concurrent.atomic.AtomicLong();
+
         List<ShardSummary> shardSummaries = new ArrayList<>();
         record ShardDocument(ai.pipestream.search.query.DocumentTopDocs.DocumentHit hit, int shardId) {}
         List<ShardDocument> merged = new ArrayList<>();
@@ -349,6 +366,7 @@ public class V1Alpha1SearchNodeService implements SearchService {
                 return;
             }
             long shardStart = System.currentTimeMillis();
+            long visitedBefore = visitedTotal.get();
             DirectoryReader reader = null;
             try {
                 try {
@@ -362,13 +380,23 @@ public class V1Alpha1SearchNodeService implements SearchService {
                     continue;
                 }
                 IndexSearcher searcher = new IndexSearcher(reader);
+                org.apache.lucene.search.knn.KnnCollectorManager manager = null;
+                if (floor != null) {
+                    manager = new ai.pipestream.search.query.knn.CountingKnnCollectorManager(
+                            ai.pipestream.search.query.knn.DocumentCentricKnnFactory.manager(
+                                    query.luceneK(), floor, parentsFilter,
+                                    1f / config.numShards(), floorActivationK),
+                            visitedTotal);
+                }
                 ai.pipestream.search.query.DocumentTopDocs topDocs =
-                        hybridExecutor.executeDocumentCentric(query, searcher, parentsFilter, chunksPerHit);
+                        hybridExecutor.executeDocumentCentric(query, searcher, parentsFilter,
+                                chunksPerHit, manager);
                 for (ai.pipestream.search.query.DocumentTopDocs.DocumentHit hit : topDocs.hits()) {
                     merged.add(new ShardDocument(hit, shardId));
                 }
                 shardSummaries.add(ShardSummary.newBuilder()
                         .setShardId(shardId)
+                        .setVisited(visitedTotal.get() - visitedBefore)
                         .setTookMs(System.currentTimeMillis() - shardStart)
                         .setStatus(com.google.rpc.Status.newBuilder().setCode(0).build())
                         .build());
@@ -445,6 +473,7 @@ public class V1Alpha1SearchNodeService implements SearchService {
                 .addAllTopDocIds(topDocIds)
                 .setTotalHits(merged.size())
                 .setTotalHitsRelation(TotalHitsRelation.TOTAL_HITS_RELATION_GTE)
+                .setVisited(visitedTotal.get())
                 .setTookMs(System.currentTimeMillis() - startTime)
                 .setKthBestFloor(kthBestFloor)
                 .setTerminatedBy(TerminationReason.TERMINATION_REASON_COMPLETE)

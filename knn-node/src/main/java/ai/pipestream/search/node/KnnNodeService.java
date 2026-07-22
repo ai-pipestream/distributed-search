@@ -346,14 +346,24 @@ public class KnnNodeService implements ai.pipestream.search.grpc.KnnNodeService 
 
                 KnnCollectorManager manager;
                 if (request.getCollaborative()) {
+                    // Below globalShare = 1 the greediness must be derived from
+                    // the clamp: a constant greediness against a below-queue
+                    // ascent gate degenerates into a fixed per-shard quota
+                    // (the fork's own benchmarked warning).
+                    float share = resolveGlobalShare();
+                    float greediness = share < 1f
+                            ? FloorAwareKnnCollector.greedinessForClamp(
+                                    SharedFloorKnnCollectorManager.perShardGate(internalK, share),
+                                    FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS)
+                            : FloorAwareKnnCollector.DEFAULT_GREEDINESS;
                     manager = new SharedFloorKnnCollectorManager(
                             internalK,
                             sharedFloor,
-                            FloorAwareKnnCollector.DEFAULT_GREEDINESS,
+                            greediness,
                             SharedFloorKnnCollectorManager.DEFAULT_FLOOR_ACTIVATION_K,
                             FloorAwareKnnCollector.DEFAULT_MIN_EXPLORATION_SLOTS,
                             FloorAwareKnnCollector.DEFAULT_SYNC_INTERVAL,
-                            resolveGlobalShare());
+                            share);
                 } else {
                     manager = new TopKnnCollectorManager(internalK, searcher);
                 }

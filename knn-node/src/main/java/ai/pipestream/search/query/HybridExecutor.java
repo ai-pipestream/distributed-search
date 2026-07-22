@@ -110,6 +110,20 @@ public class HybridExecutor {
                                                   IndexSearcher searcher,
                                                   BitSetProducer parentsFilter,
                                                   int chunksPerHit) throws IOException {
+        return executeDocumentCentric(query, searcher, parentsFilter, chunksPerHit, null);
+    }
+
+    /**
+     * @param collectorManager shared-floor collector manager for collaborative
+     *        queries (one per query, shared across this query's shards), or
+     *        null for the stock diversifying search
+     */
+    public DocumentTopDocs executeDocumentCentric(DocumentCentricKnnQuery query,
+                                                  IndexSearcher searcher,
+                                                  BitSetProducer parentsFilter,
+                                                  int chunksPerHit,
+                                                  org.apache.lucene.search.knn.KnnCollectorManager collectorManager)
+            throws IOException {
         // A user filter compiles against parent-scope (stub) fields; the
         // block-join query filters CHILDREN, so map parent matches onto
         // their children.
@@ -117,9 +131,12 @@ public class HybridExecutor {
                 ? null
                 : new ToChildBlockJoinQuery(query.filter(), parentsFilter);
 
-        DiversifyingChildrenFloatKnnVectorQuery joinQuery =
-                new DiversifyingChildrenFloatKnnVectorQuery(query.field(), query.target(),
-                        childFilter, query.luceneK(), parentsFilter);
+        org.apache.lucene.search.Query joinQuery = collectorManager == null
+                ? new DiversifyingChildrenFloatKnnVectorQuery(query.field(), query.target(),
+                        childFilter, query.luceneK(), parentsFilter)
+                : new ai.pipestream.search.query.knn.SharedFloorParentJoinQuery(
+                        query.field(), query.target(), childFilter, query.luceneK(),
+                        parentsFilter, collectorManager);
         TopDocs parents = searcher.search(joinQuery, query.luceneK());
 
         int limit = Math.min(query.k(), parents.scoreDocs.length);

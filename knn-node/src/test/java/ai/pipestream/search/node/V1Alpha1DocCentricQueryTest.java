@@ -279,6 +279,40 @@ public class V1Alpha1DocCentricQueryTest {
                 "match_all returns chunks only; parent stubs must never surface");
     }
 
+    /**
+     * P4 wiring proof: collaborative=true routes through the shared-floor
+     * manager (visited becomes a real number, not zero) and returns exactly
+     * the same documents and scores as the stock path.
+     */
+    @Test
+    public void collaborativeFloorReturnsIdenticalResults() {
+        List<SearchResponse> stock = search(docCentricRequest().build());
+        List<SearchResponse> collaborative = search(SearchRequest.newBuilder()
+                .setCollection(DC)
+                .setSize(10)
+                .setQuery(Query.newBuilder().setKnn(KnnQuery.newBuilder()
+                        .setField("embedding")
+                        .setVector(QUERY_VECTOR)
+                        .setK(3)
+                        .setDocumentCentric(true)
+                        .setCollaborative(true)))
+                .build());
+
+        List<Hit> stockHits = hits(stock);
+        List<Hit> collabHits = hits(collaborative);
+        Assertions.assertEquals(
+                stockHits.stream().map(Hit::getDocId).toList(),
+                collabHits.stream().map(Hit::getDocId).toList());
+        for (int i = 0; i < stockHits.size(); i++) {
+            Assertions.assertEquals(stockHits.get(i).getScore(), collabHits.get(i).getScore(),
+                    "collaborative traversal must not change scores");
+        }
+
+        Summary summary = collaborative.get(collaborative.size() - 1).getSummary();
+        Assertions.assertTrue(summary.getVisited() > 0,
+                "collaborative queries must report REAL visit counts");
+    }
+
     @Test
     public void documentCentricRequiresDocCentricCollectionAndTopLevel() {
         // Flat collection: FAILED_PRECONDITION.
