@@ -13,13 +13,13 @@ repositories {
     maven {
         url = uri('https://central.sonatype.com/repository/maven-snapshots/')
         content {
-            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp)(-.*)?')
+            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp|protomolt)(-.*)?')
         }
     }
     maven {
         url = uri('https://git.rokkon.com/api/packages/ai-pipestream/maven')
         content {
-            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp)(-.*)?')
+            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp|protomolt)(-.*)?')
         }
     }
     mavenCentral()
@@ -86,6 +86,14 @@ dependencies {
     // Mode-A ingest: server-side chunking (sentence-packed, rules-v1)
     implementation 'ai.pipestream.search:chunker-spi'
     runtimeOnly 'ai.pipestream.search:chunker-sentence'
+    // ProtoMolt index SPI: BlockJoinLuceneMapper registers the block-join
+    // block builder as the "distributed-lucene" engine, delegating flat field
+    // mapping to ProtoLuceneMapper. The snapshots depend on the same fork
+    // Lucene GAV as this build, so no second Lucene lineage enters the
+    // classpath.
+    def protomoltVersion = '0.1.0-SNAPSHOT'
+    implementation "ai.pipestream:protomolt-index-spi:${protomoltVersion}"
+    implementation "ai.pipestream:protomolt-index-lucene:${protomoltVersion}"
     testImplementation 'io.quarkus:quarkus-junit'
     testImplementation 'io.rest-assured:rest-assured'
 }
