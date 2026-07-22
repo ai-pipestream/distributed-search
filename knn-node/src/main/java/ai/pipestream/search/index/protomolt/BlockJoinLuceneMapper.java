@@ -1,6 +1,7 @@
 package ai.pipestream.search.index.protomolt;
 
 import ai.pipestream.proto.index.lucene.ProtoLuceneMapper;
+import ai.pipestream.proto.index.spi.BlockRole;
 import ai.pipestream.proto.index.spi.IndexFieldKind;
 import ai.pipestream.proto.index.spi.IndexingPlan;
 import ai.pipestream.proto.index.spi.SearchEngineIndexer;
@@ -31,16 +32,19 @@ import java.util.Objects;
  * {@code chunk_id}, {@code _chunk_ord}) that the engine's write and query
  * paths key on.
  *
- * <p><b>Plan contract.</b> The chunk scope is the plan's repeated NESTED
- * field (tag it {@code distributed-lucene.role=chunks} when a plan carries
- * more than one). Fields under that path are mapped onto each chunk child;
- * everything else lands on the stub. VECTOR fields outside the chunk scope
- * are rejected: the stub must not carry a vector, or block-join collectors
- * would attribute it as a chunk. Optional roles: {@code doc_id} names the
- * identity field (consumed, not re-emitted — the builder indexes it
- * canonically on every block member), {@code chunk_id} names a per-chunk id
- * field (defaults to {@code <doc_id>#<generation>#<ordinal>}, the same
- * convention the v1alpha1 ingest path assigns).
+ * <p><b>Plan contract.</b> The chunk scope is the field carrying
+ * {@link BlockRole#CHUNKS} (the first-class vocabulary; the
+ * {@code distributed-lucene.role=chunks} engine param and a lone repeated
+ * NESTED field remain as fallbacks). Fields under that path are mapped onto
+ * each chunk child; everything else lands on the stub. VECTOR fields outside
+ * the chunk scope are rejected: the stub must not carry a vector, or
+ * block-join collectors would attribute it as a chunk. Identity roles work
+ * the same way: {@link BlockRole#DOC_ID} (or {@code role=doc_id}, or a field
+ * named {@code doc_id}) is consumed rather than re-emitted since the builder
+ * indexes it canonically on every block member, and {@link BlockRole#CHUNK_ID}
+ * (or {@code role=chunk_id}) names a per-chunk id field, defaulting to
+ * {@code <doc_id>#<generation>#<ordinal>}, the same convention the v1alpha1
+ * ingest path assigns.
  */
 public final class BlockJoinLuceneMapper implements SearchEngineIndexer {
 
@@ -151,12 +155,13 @@ public final class BlockJoinLuceneMapper implements SearchEngineIndexer {
                 continue;
             }
             boolean inChunkScope = field.path().startsWith(chunkPrefix);
+            BlockRole blockRole = field.hint().blockRole();
             String role = field.hint().engineParams(ENGINE_ID).get(ROLE_PARAM);
             if (inChunkScope) {
                 IndexingPlan.IndexedField relative = new IndexingPlan.IndexedField(
                         field.path().substring(chunkPrefix.length()),
                         field.fieldName(), field.hint(), field.repeated());
-                if (ROLE_CHUNK_ID.equals(role)) {
+                if (blockRole == BlockRole.CHUNK_ID || ROLE_CHUNK_ID.equals(role)) {
                     // consumed as identity; BlockJoinFields.CHUNK_ID carries it
                     chunkIdField = relative;
                 } else {
@@ -164,8 +169,9 @@ public final class BlockJoinLuceneMapper implements SearchEngineIndexer {
                 }
                 continue;
             }
-            if (ROLE_DOC_ID.equals(role)
-                    || (role == null && BlockJoinFields.DOC_ID.equals(field.fieldName()))) {
+            if (blockRole == BlockRole.DOC_ID || ROLE_DOC_ID.equals(role)
+                    || (blockRole == BlockRole.UNSPECIFIED && role == null
+                            && BlockJoinFields.DOC_ID.equals(field.fieldName()))) {
                 // consumed as identity; the builder indexes doc_id on every member
                 docIdField = field;
                 continue;
@@ -184,13 +190,17 @@ public final class BlockJoinLuceneMapper implements SearchEngineIndexer {
     }
 
     /**
-     * The repeated NESTED field, disambiguated by {@code role=chunks} when a
-     * plan hints more than one.
+     * The {@link BlockRole#CHUNKS} field; fallbacks for plans built without
+     * the vocabulary: the {@code role=chunks} engine param, then a lone
+     * repeated NESTED field.
      */
     private static IndexingPlan.IndexedField resolveChunkField(IndexingPlan plan)
             throws MappingException {
         List<IndexingPlan.IndexedField> candidates = new ArrayList<>();
         for (IndexingPlan.IndexedField field : plan.fields()) {
+            if (field.hint().blockRole() == BlockRole.CHUNKS) {
+                return field;
+            }
             if (field.type() != IndexFieldKind.NESTED || !field.repeated()) {
                 continue;
             }
@@ -203,9 +213,8 @@ public final class BlockJoinLuceneMapper implements SearchEngineIndexer {
             return candidates.get(0);
         }
         throw new MappingException(candidates.isEmpty()
-                ? "No chunk field: the plan needs exactly one repeated NESTED field"
-                : "Ambiguous chunk field: tag one repeated NESTED field with "
-                        + ENGINE_ID + "." + ROLE_PARAM + "=" + ROLE_CHUNKS,
+                ? "No chunk field: hint one repeated message field with BLOCK_ROLE_CHUNKS"
+                : "Ambiguous chunk field: hint exactly one field with BLOCK_ROLE_CHUNKS",
                 plan.messageFullName());
     }
 }

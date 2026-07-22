@@ -25,6 +25,17 @@ repositories {
     mavenCentral()
 }
 
+configurations.configureEach {
+    resolutionStrategy {
+        // ProtoMolt gencode is compiled with protoc 4.35.1 while the Quarkus
+        // platform pins the 4.35.0 runtime, and protobuf rejects gencode newer
+        // than its runtime at class-load time. Force the patch bump; force wins
+        // over the enforced platform.
+        force 'com.google.protobuf:protobuf-java:4.35.1'
+        force 'com.google.protobuf:protobuf-java-util:4.35.1'
+    }
+}
+
 dependencies {
     implementation enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}")
     implementation libs.scalecube.cluster

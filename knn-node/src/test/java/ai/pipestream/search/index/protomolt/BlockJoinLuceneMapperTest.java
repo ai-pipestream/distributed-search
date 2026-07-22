@@ -1,8 +1,14 @@
 package ai.pipestream.search.index.protomolt;
 
 import ai.pipestream.proto.descriptors.DescriptorRegistry;
+import ai.pipestream.proto.index.hints.FieldIndexHint;
+import ai.pipestream.proto.index.hints.IndexFieldType;
+import ai.pipestream.proto.index.hints.IndexingHintsProto;
 import ai.pipestream.proto.index.spi.IndexFieldKind;
 import ai.pipestream.proto.index.spi.IndexingPlan;
+import ai.pipestream.proto.index.spi.IndexingPlanFactory;
+import ai.pipestream.proto.index.spi.InferringIndexingHintSource;
+import ai.pipestream.proto.index.spi.ProtoOptionsIndexingHintSource;
 import ai.pipestream.proto.index.spi.ResolvedFieldHint;
 import ai.pipestream.proto.index.spi.SearchEngineIndexers;
 import ai.pipestream.proto.index.spi.VectorSimilarity;
@@ -15,6 +21,7 @@ import ai.pipestream.search.index.doc.BlockWriter;
 import ai.pipestream.search.query.DocumentCentricKnnQuery;
 import ai.pipestream.search.query.DocumentTopDocs;
 import ai.pipestream.search.query.HybridExecutor;
+import com.google.protobuf.DescriptorProtos;
 import com.google.protobuf.DescriptorProtos.DescriptorProto;
 import com.google.protobuf.DescriptorProtos.FieldDescriptorProto;
 import com.google.protobuf.DescriptorProtos.FileDescriptorProto;
@@ -219,6 +226,97 @@ class BlockJoinLuceneMapperTest {
         } finally {
             manager.releaseReader(reader);
         }
+    }
+
+    /**
+     * The first-class vocabulary end to end: BLOCK_ROLE hints in proto
+     * options drive IndexingPlanFactory, whose plan drives the mapper with
+     * no engine params anywhere.
+     */
+    @Test
+    void blockRoleHintsDriveTheWholePipelineFromProtoOptions() throws Exception {
+        DescriptorProtos.FieldOptions docIdHint = DescriptorProtos.FieldOptions.newBuilder()
+                .setExtension(IndexingHintsProto.index, FieldIndexHint.newBuilder()
+                        .setType(IndexFieldType.INDEX_FIELD_TYPE_KEYWORD)
+                        .setBlockRole(ai.pipestream.proto.index.hints.BlockRole.BLOCK_ROLE_DOC_ID)
+                        .build())
+                .build();
+        DescriptorProtos.FieldOptions chunksHint = DescriptorProtos.FieldOptions.newBuilder()
+                .setExtension(IndexingHintsProto.index, FieldIndexHint.newBuilder()
+                        .setType(IndexFieldType.INDEX_FIELD_TYPE_NESTED)
+                        .setBlockRole(ai.pipestream.proto.index.hints.BlockRole.BLOCK_ROLE_CHUNKS)
+                        .build())
+                .build();
+        DescriptorProtos.FieldOptions vectorHint = DescriptorProtos.FieldOptions.newBuilder()
+                .setExtension(IndexingHintsProto.index, FieldIndexHint.newBuilder()
+                        .setType(IndexFieldType.INDEX_FIELD_TYPE_VECTOR)
+                        .setVectorDims(4)
+                        .build())
+                .build();
+        DescriptorProto passage = DescriptorProto.newBuilder().setName("Passage")
+                .addField(FieldDescriptorProto.newBuilder()
+                        .setName("text").setNumber(1)
+                        .setType(FieldDescriptorProto.Type.TYPE_STRING)
+                        .setLabel(FieldDescriptorProto.Label.LABEL_OPTIONAL))
+                .addField(FieldDescriptorProto.newBuilder()
+                        .setName("embedding").setNumber(2)
+                        .setType(FieldDescriptorProto.Type.TYPE_FLOAT)
+                        .setLabel(FieldDescriptorProto.Label.LABEL_REPEATED)
+                        .setOptions(vectorHint))
+                .build();
+        DescriptorProto hinted = DescriptorProto.newBuilder().setName("HintedArticle")
+                .addField(FieldDescriptorProto.newBuilder()
+                        .setName("doc_id").setNumber(1)
+                        .setType(FieldDescriptorProto.Type.TYPE_STRING)
+                        .setLabel(FieldDescriptorProto.Label.LABEL_OPTIONAL)
+                        .setOptions(docIdHint))
+                .addField(FieldDescriptorProto.newBuilder()
+                        .setName("title").setNumber(2)
+                        .setType(FieldDescriptorProto.Type.TYPE_STRING)
+                        .setLabel(FieldDescriptorProto.Label.LABEL_OPTIONAL))
+                .addField(FieldDescriptorProto.newBuilder()
+                        .setName("passages").setNumber(3)
+                        .setType(FieldDescriptorProto.Type.TYPE_MESSAGE)
+                        .setTypeName(".pm.Passage")
+                        .setLabel(FieldDescriptorProto.Label.LABEL_REPEATED)
+                        .setOptions(chunksHint))
+                .build();
+        Descriptors.FileDescriptor file = Descriptors.FileDescriptor.buildFrom(
+                FileDescriptorProto.newBuilder()
+                        .setName("hinted_article.proto").setPackage("pm").setSyntax("proto3")
+                        .addMessageType(hinted).addMessageType(passage)
+                        .build(),
+                new Descriptors.FileDescriptor[0]);
+        Descriptors.Descriptor descriptor = file.findMessageTypeByName("HintedArticle");
+
+        IndexingPlan plan = new IndexingPlanFactory(
+                new ProtoOptionsIndexingHintSource().orElse(new InferringIndexingHintSource()))
+                .create(descriptor);
+
+        Descriptors.Descriptor passageType = file.findMessageTypeByName("Passage");
+        DynamicMessage.Builder child = DynamicMessage.newBuilder(passageType)
+                .setField(passageType.findFieldByName("text"), "the only passage");
+        for (float component : new float[]{0, 1, 0, 0}) {
+            child.addRepeatedField(passageType.findFieldByName("embedding"), component);
+        }
+        DynamicMessage message = DynamicMessage.newBuilder(descriptor)
+                .setField(descriptor.findFieldByName("doc_id"), "hinted-1")
+                .setField(descriptor.findFieldByName("title"), "vocabulary driven")
+                .addRepeatedField(descriptor.findFieldByName("passages"), child.build())
+                .build();
+
+        List<Document> block = mapper.map(message, plan);
+
+        Assertions.assertEquals(2, block.size());
+        Document stub = block.get(1);
+        Assertions.assertEquals("hinted-1", stub.get(BlockJoinFields.DOC_ID));
+        Assertions.assertEquals(1, stub.getFields(BlockJoinFields.DOC_ID).length,
+                "the DOC_ID-role field is consumed, not re-emitted next to the builder's");
+        Assertions.assertFalse(hasVector(stub));
+        Document chunk = block.get(0);
+        Assertions.assertTrue(hasVector(chunk),
+                "the factory-expanded chunk scope carries the hinted vector");
+        Assertions.assertEquals("the only passage", chunk.get("text"));
     }
 
     @Test
