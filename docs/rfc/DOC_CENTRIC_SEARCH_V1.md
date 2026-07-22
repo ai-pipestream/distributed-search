@@ -265,7 +265,7 @@ shard.
 |---|---|
 | `DiversifyingNearestChildrenKnnCollector` (+ manager) | In Lucene `join`, shipped in the fork snapshot |
 | `FloorAwareKnnCollector`, `GlobalKnnFloor`, gate math | In the fork sandbox (apache/lucene#16357), unchanged |
-| `SharedFloorDiversifyingKnnCollectorManager` | New, small: composes the two per [§5.2](#52-floor-decoration) |
+| `SharedFloorDiversifyingKnnCollectorManager` | Implemented in the fork's join module (`ai-pipestream/lucene@df49da5b`), with per-parent publication in `FloorAwareDiversifyingChildrenKnnCollector`; unit, policy, and recall tests green |
 | Balanced similarity clustering of chunks | New, in the index pipeline (embeddings stage) |
 | Block-join write path with parent stubs | New, in collection indexing |
 | Coordinator merge by doc id with chunk payloads | New, replaces flat ranking in document-centric mode |
@@ -288,6 +288,55 @@ shard.
 - **Bench:** recall, latency, and visits against flat-chunk mode at equal
   k, on the existing benchmark corpora; ingestion throughput against the
   nested-style baseline.
+
+### 10.1 Proof order
+
+Mechanism first, composition second. The flat shared-floor sweep is the
+foundation: the composition inherits the gate math, greediness clamp, sync
+discipline, and pro-rata sizing from the flat collector manager, so its only
+open question is whether the visit savings survive the unit change from
+documents to parents. If the flat numbers do not hold, there is no
+document-centric claim to make.
+
+For the composition itself, soundness and value are proven separately.
+Soundness is already covered by unit tests, which assert the floor never
+exceeds the true top-parents cutoff exactly, per query, plus the
+publish-once-per-parent invariant. What the bench must prove is value, and
+that is not a foregone conclusion: a parent floor converges more slowly
+than a document floor, because the heap needs D distinct parents and each
+parent is published exactly once, early and conservatively. The bench exists
+to show the slower convergence still nets out.
+
+Bench tooling for the document-centric arm (the block-join index builder
+and the exact parent ground truth) is independent of the flat results and
+can be built while the flat sweep runs. The headline claims land in order:
+flat sweep first, composition second.
+
+### 10.2 Bench metrics and graphs
+
+The collectors expose `visitedCount`, so the harness only records; no new
+instrumentation is needed in the library.
+
+- Visited vectors per query at matched recall, stock versus floored, swept
+  over k (log-log). The primary evidence graph.
+- Recall versus visits per greediness setting, the tradeoff curve.
+- Per-shard visit distribution: hot shards run long, cold shards stop
+  early.
+- Floor convergence trace: floor value over visited count per shard, with
+  the merged cutoff as a reference line. This graph is unique to the
+  mechanism and shows why it works.
+- Chunks-per-document scaling, the differentiator the flat bench cannot
+  produce: fixed corpus, vary chunks per document and D, plot visits at
+  matched parent recall. Stock pays per chunk while the floor converges in
+  parent units, so the visit gap should widen with chunk multiplicity. This
+  is also the regime where nested-style baselines degrade, so the stock
+  block-join arm doubles as the competitive comparison.
+
+Every bench run asserts the floor never exceeds the true cutoff,
+continuously, as telemetry. The cost is nil (the floor object is already
+there) and it turns each run into a soundness proof at scale: a contract
+violation caught on a multi-shard run is worth far more than one caught in
+a toy test.
 
 ## 11. Non-goals
 
