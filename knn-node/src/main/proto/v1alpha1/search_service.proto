@@ -54,6 +54,10 @@ message SearchRequest {
   // Pseudonymous context for experiment assignment (never PII). Unset =
   // no experiment participation; the collection default profile applies.
   ClientContext client_context = 9;
+  // Max ChunkHits per Hit in document-centric mode. 0 = server default (8).
+  // Response shaping, like `fields` -- a 500-chunk document would otherwise
+  // produce a multi-megabyte Hit frame.
+  int32 chunks_per_hit = 10;
 }
 
 // One frame of the search stream. Exactly one variant per message.

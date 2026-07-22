@@ -177,6 +177,11 @@ message KnnQuery {
   // Max graph nodes this clause may visit, summed across shards.
   // 0 = inherit the request-level SearchBudget.max_visits.
   int64 visit_budget = 7;
+  // Return top-k DOCUMENTS with per-chunk scores instead of top-k chunks.
+  // Requires a document-centric collection (FAILED_PRECONDITION otherwise)
+  // and is only valid as the top-level query (INVALID_ARGUMENT inside bool /
+  // hybrid / filter nodes). Orthogonal to `collaborative`.
+  bool document_centric = 8;
 }
 
 // Combines several sub-queries and fuses their ranked results.
@@ -311,6 +316,26 @@ message Hit {
   // display/analytics hint (what the user saw, in stream order); the final
   // ranking in Summary.top_doc_ids supersedes them.
   int32 result_position = 6;
+  // Above-threshold chunks, best score first. Populated only in
+  // document-centric mode; `score` is the max over this list.
+  repeated ChunkHit chunks = 7;
+}
+
+// Per-chunk scores returned in document-centric mode.
+message ChunkHit {
+  string chunk_id = 1;
+  // Vector similarity of THIS chunk against the query vector. Computed by an
+  // exact pass over the winning block, so every chunk of a returned document
+  // is scored, including ones HNSW never visited. Never a reranked score.
+  float score = 2;
+  // Populated only when the chunk representation declares stored text.
+  // Otherwise use start_offset/end_offset against the parent document.
+  string text = 3;
+  int32 ordinal = 4;
+  // Shard whose block contributed this chunk.
+  int32 shard_id = 5;
+  int32 start_offset = 6;
+  int32 end_offset = 7;
 }
 
 // Periodic execution telemetry. Frequency is server-chosen unless

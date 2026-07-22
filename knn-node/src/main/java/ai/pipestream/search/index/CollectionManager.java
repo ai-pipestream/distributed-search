@@ -270,6 +270,21 @@ public class CollectionManager {
         reader.decRef();
     }
 
+    /** parent-stub bitset producers, one per collection (memoized per segment core). */
+    private final ConcurrentHashMap<String, org.apache.lucene.search.join.BitSetProducer>
+            parentsFilters = new ConcurrentHashMap<>();
+
+    /**
+     * The cached parent-stub bitset producer for a document-centric
+     * collection. QueryBitSetProducer memoizes on the segment core key, so a
+     * per-query instance would rebuild a FixedBitSet over maxDoc every leaf.
+     */
+    public org.apache.lucene.search.join.BitSetProducer getParentsFilter(String collection) {
+        return parentsFilters.computeIfAbsent(collection, key ->
+                new org.apache.lucene.search.join.QueryBitSetProducer(
+                        ai.pipestream.search.index.doc.BlockJoinFields.PARENT_QUERY));
+    }
+
     public long getDocCount(String collection, int shardId) {
         String key = writerKey(collection, shardId);
         IndexWriter writer = writers.get(key);

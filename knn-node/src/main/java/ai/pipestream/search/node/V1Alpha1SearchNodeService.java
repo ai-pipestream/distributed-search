@@ -93,6 +93,34 @@ public class V1Alpha1SearchNodeService implements SearchService {
                 // Compile the v1alpha1 query AST
                 QueryPlan plan = queryCompiler.compile(request.getQuery(), schema);
 
+                boolean documentCentricQuery = plan.knnHints().stream()
+                        .anyMatch(QueryPlan.KnnHints::documentCentric);
+                if (documentCentricQuery) {
+                    if (!config.documentCentric()) {
+                        emitter.fail(io.grpc.Status.FAILED_PRECONDITION
+                                .withDescription("knn.document_centric requires a document-centric "
+                                        + "collection; '" + collectionName + "' is flat")
+                                .asRuntimeException());
+                        return;
+                    }
+                    if (!(plan instanceof QueryPlan.Single single)
+                            || !(single.query() instanceof ai.pipestream.search.query.DocumentCentricKnnQuery dcq)) {
+                        emitter.fail(io.grpc.Status.INVALID_ARGUMENT
+                                .withDescription("knn.document_centric is only valid as the "
+                                        + "top-level query")
+                                .asRuntimeException());
+                        return;
+                    }
+                    searchDocumentCentric(emitter, request, config, collectionName,
+                            dcq, queryId, startTime, targetSize);
+                    return;
+                }
+                if (config.documentCentric()) {
+                    // Flat (chunk-level) queries on a document-centric
+                    // collection must never surface parent stubs as hits.
+                    plan = excludeStubs(plan);
+                }
+
                 List<ShardSummary> shardSummaries = new ArrayList<>();
                 List<GlobalHit> globalHits = new ArrayList<>();
                 long totalHits = 0;
@@ -293,6 +321,153 @@ public class V1Alpha1SearchNodeService implements SearchService {
                 }
             }
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+    }
+
+    /**
+     * Document-centric execution: per shard, top-D parents via the
+     * diversifying block-join query plus an exact per-chunk second pass;
+     * Hit frames carry the chunk scores, Summary ranks parent doc ids.
+     */
+    private void searchDocumentCentric(io.smallrye.mutiny.subscription.MultiEmitter<? super SearchResponse> emitter,
+                                       SearchRequest request, CollectionConfig config,
+                                       String collectionName,
+                                       ai.pipestream.search.query.DocumentCentricKnnQuery query,
+                                       String queryId, long startTime, int targetSize) {
+        int chunksPerHit = request.getChunksPerHit() > 0 ? request.getChunksPerHit() : 8;
+        org.apache.lucene.search.join.BitSetProducer parentsFilter =
+                collectionManager.getParentsFilter(collectionName);
+
+        List<ShardSummary> shardSummaries = new ArrayList<>();
+        record ShardDocument(ai.pipestream.search.query.DocumentTopDocs.DocumentHit hit, int shardId) {}
+        List<ShardDocument> merged = new ArrayList<>();
+        int failedShards = 0;
+        List<String> shardErrors = new ArrayList<>();
+
+        for (int shardId = 0; shardId < config.numShards(); shardId++) {
+            if (emitter.isCancelled()) {
+                LOG.debugf("Query %s cancelled by client", queryId);
+                return;
+            }
+            long shardStart = System.currentTimeMillis();
+            DirectoryReader reader = null;
+            try {
+                try {
+                    reader = collectionManager.getReader(collectionName, shardId);
+                } catch (org.apache.lucene.index.IndexNotFoundException e) {
+                    shardSummaries.add(ShardSummary.newBuilder()
+                            .setShardId(shardId)
+                            .setTookMs(System.currentTimeMillis() - shardStart)
+                            .setStatus(com.google.rpc.Status.newBuilder().setCode(0).build())
+                            .build());
+                    continue;
+                }
+                IndexSearcher searcher = new IndexSearcher(reader);
+                ai.pipestream.search.query.DocumentTopDocs topDocs =
+                        hybridExecutor.executeDocumentCentric(query, searcher, parentsFilter, chunksPerHit);
+                for (ai.pipestream.search.query.DocumentTopDocs.DocumentHit hit : topDocs.hits()) {
+                    merged.add(new ShardDocument(hit, shardId));
+                }
+                shardSummaries.add(ShardSummary.newBuilder()
+                        .setShardId(shardId)
+                        .setTookMs(System.currentTimeMillis() - shardStart)
+                        .setStatus(com.google.rpc.Status.newBuilder().setCode(0).build())
+                        .build());
+            } catch (Exception e) {
+                LOG.errorf(e, "Error searching shard %d for collection %s", shardId, collectionName);
+                failedShards++;
+                String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                shardErrors.add("shard " + shardId + ": " + message);
+                shardSummaries.add(ShardSummary.newBuilder()
+                        .setShardId(shardId)
+                        .setTookMs(System.currentTimeMillis() - shardStart)
+                        .setStatus(com.google.rpc.Status.newBuilder().setCode(13).setMessage(message).build())
+                        .build());
+            } finally {
+                if (reader != null) {
+                    try {
+                        collectionManager.releaseReader(reader);
+                    } catch (IOException ignored) {
+                        // release failures are non-fatal
+                    }
+                }
+            }
+        }
+
+        if (failedShards > 0 && failedShards == config.numShards()) {
+            emitter.fail(io.grpc.Status.UNAVAILABLE
+                    .withDescription("All " + failedShards + " shards failed: "
+                            + String.join("; ", shardErrors))
+                    .asRuntimeException());
+            return;
+        }
+
+        // Global ranking by parent score (max over chunks); ties break on
+        // docId so replicas agree. Single-shard placement means one entry
+        // per parent; the multi-shard merge collapses duplicates by doc id.
+        merged.sort((a, b) -> {
+            int byScore = Float.compare(b.hit().score(), a.hit().score());
+            return byScore != 0 ? byScore : a.hit().docId().compareTo(b.hit().docId());
+        });
+
+        int emitted = 0;
+        float kthBestFloor = Float.NEGATIVE_INFINITY;
+        List<String> topDocIds = new ArrayList<>();
+        for (ShardDocument entry : merged) {
+            if (emitted >= targetSize || emitter.isCancelled()) {
+                break;
+            }
+            emitted++;
+            ai.pipestream.search.query.DocumentTopDocs.DocumentHit docHit = entry.hit();
+            topDocIds.add(docHit.docId());
+            kthBestFloor = Math.max(kthBestFloor, docHit.score());
+
+            Hit.Builder hitBuilder = Hit.newBuilder()
+                    .setDocId(docHit.docId())
+                    .setScore(docHit.score())
+                    .setShardId(entry.shardId())
+                    .setResultPosition(emitted);
+            for (ai.pipestream.search.query.DocumentTopDocs.ChunkScore chunk : docHit.chunks()) {
+                hitBuilder.addChunks(ChunkHit.newBuilder()
+                        .setChunkId(chunk.chunkId())
+                        .setScore(chunk.score())
+                        .setText(chunk.text())
+                        .setOrdinal(chunk.ordinal())
+                        .setShardId(entry.shardId())
+                        .setStartOffset(chunk.startOffset())
+                        .setEndOffset(chunk.endOffset())
+                        .build());
+            }
+            emitter.emit(SearchResponse.newBuilder().setHit(hitBuilder.build()).build());
+        }
+
+        Summary summary = Summary.newBuilder()
+                .setQueryId(queryId)
+                .addAllTopDocIds(topDocIds)
+                .setTotalHits(merged.size())
+                .setTotalHitsRelation(TotalHitsRelation.TOTAL_HITS_RELATION_GTE)
+                .setTookMs(System.currentTimeMillis() - startTime)
+                .setKthBestFloor(kthBestFloor)
+                .setTerminatedBy(TerminationReason.TERMINATION_REASON_COMPLETE)
+                .addAllShardSummaries(shardSummaries)
+                .build();
+        emitter.emit(SearchResponse.newBuilder().setSummary(summary).build());
+        emitter.complete();
+    }
+
+    /** Rebuilds a plan with parent stubs excluded from every leaf query. */
+    private static QueryPlan excludeStubs(QueryPlan plan) {
+        return switch (plan) {
+            case QueryPlan.Single single -> new QueryPlan.Single(
+                    new org.apache.lucene.search.BooleanQuery.Builder()
+                            .add(single.query(), org.apache.lucene.search.BooleanClause.Occur.MUST)
+                            .add(ai.pipestream.search.index.doc.BlockJoinFields.PARENT_QUERY,
+                                    org.apache.lucene.search.BooleanClause.Occur.MUST_NOT)
+                            .build(),
+                    single.knnHints());
+            case QueryPlan.Hybrid hybrid -> new QueryPlan.Hybrid(
+                    hybrid.subPlans().stream().map(V1Alpha1SearchNodeService::excludeStubs).toList(),
+                    hybrid.fusion());
+        };
     }
 
     /**

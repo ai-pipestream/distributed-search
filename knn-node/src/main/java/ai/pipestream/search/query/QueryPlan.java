@@ -22,12 +22,16 @@ public sealed interface QueryPlan permits QueryPlan.Single, QueryPlan.Hybrid {
     /**
      * Per-knn-clause execution hints, carried verbatim from the AST.
      *
-     * @param field         the dense_vector field the clause targets
-     * @param collaborative cross-shard collaborative traversal requested
-     * @param visitBudget   max graph nodes this clause may visit (summed
-     *                      across shards); 0 = inherit SearchBudget.max_visits
+     * @param field           the dense_vector field the clause targets
+     * @param collaborative   cross-shard collaborative traversal requested
+     * @param visitBudget     max graph nodes this clause may visit (summed
+     *                        across shards); 0 = inherit SearchBudget.max_visits
+     * @param documentCentric top-k documents with per-chunk scores requested
+     * @param k               the clause's requested top-k (execution trims to
+     *                        it when num_candidates widened the Lucene k)
      */
-    record KnnHints(String field, boolean collaborative, long visitBudget) {}
+    record KnnHints(String field, boolean collaborative, long visitBudget,
+                    boolean documentCentric, int k) {}
 
     /** A plan that compiles to one executable Lucene query. */
     record Single(org.apache.lucene.search.Query query, List<KnnHints> knnHints) implements QueryPlan {
