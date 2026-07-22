@@ -20,7 +20,11 @@ subprojects {
   }
 
   repositories {
-    mavenLocal()
+    // Never on CI: fresh-clone gate; runner ~/.m2 state must not outrank
+    // published snapshots (mavenLocal is consulted first and has no TTL).
+    if (System.getenv('CI') == null) {
+      mavenLocal()
+    }
     // Central's snapshot repository first (reachable from any runner), the ai.pipestream
     // registry as fallback; both scoped to the fork so other artifacts never query a host
     // some runners cannot reach.

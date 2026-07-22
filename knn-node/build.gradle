@@ -4,7 +4,13 @@ plugins {
 }
 
 repositories {
-    mavenLocal()
+    // Never on CI: the gate proves a fresh clone builds from published
+    // artifacts, and runner ~/.m2 state (anything a previous job or another
+    // agent published locally) silently outranks fresh snapshots because
+    // mavenLocal is consulted first and has no cache TTL.
+    if (System.getenv('CI') == null) {
+        mavenLocal()
+    }
     // The ai.pipestream fork snapshots (shared-floor Lucene, preview OpenNLP) resolve from
     // Central's snapshot repository, which every runner can reach; the ai.pipestream registry
     // stays as a fallback. Both are scoped to the forks: without the filter, every dependency
