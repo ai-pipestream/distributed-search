@@ -4,6 +4,14 @@ import ai.pipestream.search.grpc.GrpcChannelCache;
 import ai.pipestream.search.index.CollectionConfig;
 import ai.pipestream.search.index.CollectionManager;
 import ai.pipestream.search.index.ShardRouter;
+import ai.pipestream.search.index.doc.BlockJoinDocumentBuilder;
+import ai.pipestream.search.index.doc.BlockJoinFields;
+import ai.pipestream.search.index.doc.BlockWriter;
+import ai.pipestream.search.index.doc.LuceneFieldEncoder;
+import ai.pipestream.search.index.doc.ParentDocumentProjector;
+import ai.pipestream.search.schema.CompiledField;
+import ai.pipestream.search.schema.CompiledSchema;
+import ai.pipestream.search.schema.SchemaStore;
 import ai.pipestream.search.v1alpha1.*;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.mutiny.Multi;
@@ -67,6 +75,8 @@ public class V1Alpha1IndexNodeService implements IndexService {
     private static final int CODE_OK = 0;
     private static final int CODE_INVALID_ARGUMENT = 3;
     private static final int CODE_NOT_FOUND = 5;
+    private static final int CODE_ALREADY_EXISTS = 6;
+    private static final int CODE_FAILED_PRECONDITION = 9;
     private static final int CODE_UNIMPLEMENTED = 12;
     private static final int CODE_INTERNAL = 13;
     private static final int CODE_UNAVAILABLE = 14;
@@ -80,9 +90,20 @@ public class V1Alpha1IndexNodeService implements IndexService {
     @Inject
     GrpcChannelCache channelCache;
 
+    @Inject
+    SchemaStore schemaStore;
+
+    @Inject
+    ParentDocumentProjector projector;
+
+    @Inject
+    BlockWriter blockWriter;
+
     /** Per-stream mutable state. */
     private static final class BulkSession {
         volatile String defaultCollection = "";
+        volatile SchemaPin defaultSchema;
+        volatile IndexPolicy defaultPolicy;
         /** Collections written locally since stream start (flush targets). */
         final Set<String> touchedCollections = ConcurrentHashMap.newKeySet();
         /** Remote owners forwarded to since stream start, keyed host:port. */
@@ -113,12 +134,34 @@ public class V1Alpha1IndexNodeService implements IndexService {
     private Multi<BulkIndexResponse> handleFrame(BulkSession session, BulkIndexRequest request) {
         return switch (request.getFrameCase()) {
             case OPTIONS -> {
-                session.defaultCollection = request.getOptions().getCollection();
+                BulkOptions options = request.getOptions();
+                session.defaultCollection = options.getCollection();
+                if (options.hasSchema()) {
+                    session.defaultSchema = options.getSchema();
+                    // A stale bulk load must fail at frame 1, not at frame
+                    // 900k: verify the asserted pin against the collection
+                    // pin immediately when both are known.
+                    if (!options.getCollection().isEmpty()
+                            && !options.getSchema().getDescriptorDigest().isEmpty()) {
+                        SchemaStore.StoredSchema stored =
+                                schemaStore.get(options.getCollection()).orElse(null);
+                        if (stored == null || !stored.matches(options.getSchema())) {
+                            throw io.grpc.Status.FAILED_PRECONDITION
+                                    .withDescription("BulkOptions.schema does not match the "
+                                            + "collection pin for '" + options.getCollection() + "'")
+                                    .asRuntimeException();
+                        }
+                    }
+                }
+                if (options.hasDefaultPolicy()) {
+                    session.defaultPolicy = options.getDefaultPolicy();
+                }
                 // The credit grant was already sent unconditionally; options
                 // carry no dedicated acknowledgement frame.
                 yield Multi.createFrom().empty();
             }
             case DOCUMENT -> handleDocument(session, request.getDocument()).toMulti();
+            case PARENT_DOCUMENT -> handleParentDocument(session, request.getParentDocument()).toMulti();
             case FLUSH -> handleFlush(session, request.getFlush()).toMulti();
             // An empty oneof is a no-op, not an all-defaults response frame.
             case FRAME_NOT_SET -> Multi.createFrom().empty();
@@ -147,12 +190,12 @@ public class V1Alpha1IndexNodeService implements IndexService {
             return Uni.createFrom().item(nack(seq, docReq.getDocId(), -1, CODE_INVALID_ARGUMENT,
                     "At most one of 'fields' and 'typed_document' may be set"));
         }
-        if (docReq.hasTypedDocument()) {
+        if (docReq.hasTypedDocument() && schemaStore.get(collectionName).isEmpty()) {
             // Do not ack OK for input the server would discard: reflective
-            // unpacking needs the collection's persisted descriptor set, which
-            // lands with the document-centric ingest work.
-            return Uni.createFrom().item(nack(seq, docReq.getDocId(), -1, CODE_UNIMPLEMENTED,
-                    "typed_document ingest is not implemented yet; send 'fields'"));
+            // unpacking needs the collection's registered descriptor set.
+            return Uni.createFrom().item(nack(seq, docReq.getDocId(), -1, CODE_FAILED_PRECONDITION,
+                    "typed_document ingest requires a registered proto schema for '"
+                            + collectionName + "'"));
         }
 
         String docId = docReq.getDocId().isEmpty() ? UUID.randomUUID().toString() : docReq.getDocId();
@@ -173,30 +216,99 @@ public class V1Alpha1IndexNodeService implements IndexService {
                                          IndexDocument docReq, int shardId) {
         long seq = docReq.getClientSeq();
         try {
-            Document doc = new Document();
-            doc.add(new StringField("doc_id", docId, Field.Store.YES));
+            SchemaStore.StoredSchema registered = schemaStore.get(collectionName).orElse(null);
 
-            Set<String> vectorFields = new HashSet<>();
-            for (DocumentField df : docReq.getFieldsList()) {
-                if ("doc_id".equals(df.getName())) {
-                    // A second indexed doc_id term would make upsert-by-id
-                    // delete an unrelated document.
-                    return nack(seq, docId, shardId, CODE_INVALID_ARGUMENT,
-                            "'doc_id' is a reserved field name; set IndexDocument.doc_id instead");
-                }
-                addFieldValues(doc, df, config, vectorFields);
+            Document doc;
+            if (docReq.hasTypedDocument()) {
+                // Reflective ingest against the pinned descriptor set.
+                doc = projector.projectFlatDocument(registered, docReq.getTypedDocument());
+            } else if (registered != null) {
+                // DYNAMIC_FIELDS_STRICT: names and kinds must match the
+                // registered schema; unknown fields are rejected, not
+                // silently mis-indexed.
+                doc = buildSchemaStrict(registered.compiled(), docReq);
+            } else {
+                doc = buildKindDriven(config, docReq);
             }
+            doc.add(new StringField("doc_id", docId, Field.Store.YES));
 
             IndexWriter writer = collectionManager.getWriter(collectionName, shardId);
             writer.updateDocument(new Term("doc_id", docId), doc);
             session.touchedCollections.add(collectionName);
 
             return ack(seq, docId, shardId);
-        } catch (InvalidDocumentException e) {
+        } catch (InvalidDocumentException | LuceneFieldEncoder.EncodingException
+                 | ParentDocumentProjector.InvalidPayloadException e) {
             return nack(seq, docId, shardId, CODE_INVALID_ARGUMENT, e.getMessage());
         } catch (Exception e) {
             LOG.errorf(e, "Bulk index doc %s failed", docId);
             return nack(seq, docId, shardId, CODE_INTERNAL, safeMessage(e));
+        }
+    }
+
+    /** Schema-blind fallback for collections without a registered proto schema. */
+    private static Document buildKindDriven(CollectionConfig config, IndexDocument docReq) {
+        Document doc = new Document();
+        Set<String> vectorFields = new HashSet<>();
+        for (DocumentField df : docReq.getFieldsList()) {
+            requireNotReserved(df.getName());
+            addFieldValues(doc, df, config, vectorFields);
+        }
+        return doc;
+    }
+
+    /** Strict schema-driven encoding: every field must exist with a matching kind. */
+    private static Document buildSchemaStrict(CompiledSchema compiled, IndexDocument docReq) {
+        Document doc = new Document();
+        Set<String> vectorFields = new HashSet<>();
+        for (DocumentField df : docReq.getFieldsList()) {
+            requireNotReserved(df.getName());
+            CompiledField field = compiled.field(df.getName()).orElseThrow(() ->
+                    new InvalidDocumentException("Unknown field '" + df.getName()
+                            + "'; schema fields: " + compiled.fields().stream()
+                            .map(CompiledField::indexName).sorted().toList()));
+            if (!field.repeated() && df.getValuesCount() > 1) {
+                throw new InvalidDocumentException(
+                        "Field '" + df.getName() + "' is single-valued; got "
+                                + df.getValuesCount() + " values");
+            }
+            for (FieldValue value : df.getValuesList()) {
+                switch (value.getKindCase()) {
+                    case STRING_VALUE -> LuceneFieldEncoder.addString(doc, field, value.getStringValue());
+                    case INT64_VALUE -> LuceneFieldEncoder.addLong(doc, field, value.getInt64Value());
+                    case DOUBLE_VALUE -> LuceneFieldEncoder.addDouble(doc, field, value.getDoubleValue());
+                    case BOOL_VALUE -> LuceneFieldEncoder.addBool(doc, field, value.getBoolValue());
+                    case TIMESTAMP_VALUE -> LuceneFieldEncoder.addLong(doc, field,
+                            value.getTimestampValue().getSeconds() * 1000L
+                                    + value.getTimestampValue().getNanos() / 1_000_000L);
+                    case VECTOR_VALUE -> {
+                        if (!vectorFields.add(field.indexName())) {
+                            throw new InvalidDocumentException("Field '" + df.getName()
+                                    + "': at most one vector value per field");
+                        }
+                        Vector v = value.getVectorValue();
+                        float[] arr = new float[v.getValuesCount()];
+                        for (int i = 0; i < arr.length; i++) {
+                            arr[i] = v.getValues(i);
+                        }
+                        LuceneFieldEncoder.addVector(doc, field, arr);
+                    }
+                    case KIND_NOT_SET -> throw new InvalidDocumentException(
+                            "Field '" + df.getName() + "' has a value with no kind set");
+                }
+            }
+        }
+        return doc;
+    }
+
+    private static void requireNotReserved(String name) {
+        if ("doc_id".equals(name) || (!name.isEmpty() && name.charAt(0) == '_')) {
+            // A second indexed doc_id term would make upsert-by-id delete an
+            // unrelated document; underscore names are engine-internal.
+            throw new InvalidDocumentException("'" + name + "' is a reserved field name");
+        }
+        if (name.isEmpty()) {
+            throw new InvalidDocumentException("Field with empty name");
         }
     }
 
@@ -271,6 +383,232 @@ public class V1Alpha1IndexNodeService implements IndexService {
             throw new InvalidDocumentException(
                     "Field '" + name + "': all-zero vector is invalid under COSINE similarity");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // PARENT_DOCUMENT frames (document-centric ingest, mode B)
+    // ------------------------------------------------------------------
+
+    private Uni<BulkIndexResponse> handleParentDocument(BulkSession session, IndexParentDocument req) {
+        long seq = req.getClientSeq();
+        String collectionName = req.getCollection().isEmpty()
+                ? session.defaultCollection : req.getCollection();
+
+        if (collectionName.isEmpty()) {
+            return Uni.createFrom().item(parentNack(seq, req.getDocId(),
+                    CODE_INVALID_ARGUMENT, "No collection specified"));
+        }
+        CollectionConfig config = collectionManager.getConfig(collectionName);
+        if (config == null) {
+            return Uni.createFrom().item(parentNack(seq, req.getDocId(),
+                    CODE_NOT_FOUND, "Collection not found: " + collectionName));
+        }
+        if (!config.documentCentric()) {
+            return Uni.createFrom().item(parentNack(seq, req.getDocId(), CODE_FAILED_PRECONDITION,
+                    "Collection '" + collectionName + "' is not document-centric; register a "
+                            + "schema with chunk_message set (on an empty collection) first"));
+        }
+        String docId = req.getDocId();
+        if (docId.isEmpty()) {
+            // Unlike IndexDocument, the parent id is load-bearing: replay and
+            // delete-by-parent both key on it.
+            return Uni.createFrom().item(parentNack(seq, "", CODE_INVALID_ARGUMENT,
+                    "IndexParentDocument.doc_id is required"));
+        }
+        if (req.getModeCase() == IndexParentDocument.ModeCase.SERVER_CHUNKING) {
+            return Uni.createFrom().item(parentNack(seq, docId, CODE_UNIMPLEMENTED,
+                    "Server-side chunking (mode A) is not implemented yet; send supplied_chunks"));
+        }
+        if (req.getModeCase() != IndexParentDocument.ModeCase.SUPPLIED_CHUNKS) {
+            return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
+                    "One of server_chunking / supplied_chunks must be set"));
+        }
+        SuppliedChunks supplied = req.getSuppliedChunks();
+        if (supplied.getChunksCount() == 0) {
+            return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
+                    "supplied_chunks.chunks must not be empty"));
+        }
+        int cap = req.getPolicy().getMaxChunks() > 0
+                ? Math.min(req.getPolicy().getMaxChunks(), config.maxChunksPerDocument())
+                : config.maxChunksPerDocument();
+        if (supplied.getChunksCount() > cap) {
+            return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
+                    "Parent has " + supplied.getChunksCount() + " chunks; the cap is " + cap));
+        }
+        boolean anyMissingVector = supplied.getChunksList().stream().anyMatch(c -> !c.hasVector());
+        if (anyMissingVector && supplied.getEmbedMissingVectors()) {
+            return Uni.createFrom().item(parentNack(seq, docId, CODE_UNIMPLEMENTED,
+                    "embed_missing_vectors requires server-side embedding, which is not implemented yet"));
+        }
+        if (anyMissingVector) {
+            return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
+                    "Every chunk needs a vector (or set embed_missing_vectors)"));
+        }
+        if (!req.hasPayload() || req.getPayload().getTypeUrl().isEmpty()) {
+            return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
+                    "IndexParentDocument.payload (the pinned root message, in an Any) is required"));
+        }
+
+        int[] ordinals = resolveOrdinals(supplied);
+        if (ordinals == null) {
+            return Uni.createFrom().item(parentNack(seq, docId, CODE_INVALID_ARGUMENT,
+                    "Chunk ordinals must be either all-implicit (all zero) or explicit and distinct"));
+        }
+
+        IndexPolicy.Placement placement = effectivePlacement(session, req);
+        if (placement == IndexPolicy.Placement.PLACEMENT_BALANCED_SIMILARITY
+                || placement == IndexPolicy.Placement.PLACEMENT_CONTIGUOUS) {
+            return Uni.createFrom().item(parentNack(seq, docId, CODE_UNIMPLEMENTED,
+                    "Multi-shard placement is not implemented yet; use PLACEMENT_SINGLE_SHARD"));
+        }
+
+        ShardRouter.Route route = shardRouter.route(collectionName, config.numShards(), docId);
+        return switch (route.target()) {
+            case LOCAL -> Uni.createFrom()
+                    .item(() -> writeParentLocal(session, config, collectionName, docId, req,
+                            supplied, ordinals, route.shardId()))
+                    .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+            case REMOTE -> forwardParent(session, route, collectionName, req);
+            case NO_OWNER -> Uni.createFrom().item(parentNack(seq, docId, CODE_UNAVAILABLE,
+                    "No primary owner is available for shard " + route.shardId()));
+        };
+    }
+
+    /** Implicit (all zero → by position) or explicit distinct ordinals; null = invalid. */
+    private static int[] resolveOrdinals(SuppliedChunks supplied) {
+        int n = supplied.getChunksCount();
+        int[] ordinals = new int[n];
+        boolean allZero = true;
+        for (int i = 0; i < n; i++) {
+            ordinals[i] = supplied.getChunks(i).getOrdinal();
+            if (ordinals[i] != 0) {
+                allZero = false;
+            }
+        }
+        if (allZero) {
+            for (int i = 0; i < n; i++) {
+                ordinals[i] = i;
+            }
+            return ordinals;
+        }
+        Set<Integer> seen = new HashSet<>();
+        for (int ordinal : ordinals) {
+            if (ordinal < 0 || !seen.add(ordinal)) {
+                return null;
+            }
+        }
+        return ordinals;
+    }
+
+    private static IndexPolicy.Placement effectivePlacement(BulkSession session, IndexParentDocument req) {
+        if (req.hasPolicy() && req.getPolicy().getPlacement() != IndexPolicy.Placement.PLACEMENT_UNSPECIFIED) {
+            return req.getPolicy().getPlacement();
+        }
+        IndexPolicy sessionDefault = session.defaultPolicy;
+        if (sessionDefault != null
+                && sessionDefault.getPlacement() != IndexPolicy.Placement.PLACEMENT_UNSPECIFIED) {
+            return sessionDefault.getPlacement();
+        }
+        return IndexPolicy.Placement.PLACEMENT_SINGLE_SHARD;
+    }
+
+    private BulkIndexResponse writeParentLocal(BulkSession session, CollectionConfig config,
+                                               String collectionName, String docId,
+                                               IndexParentDocument req, SuppliedChunks supplied,
+                                               int[] ordinals, int shardId) {
+        long seq = req.getClientSeq();
+        try {
+            SchemaPin asserted = req.hasSchema() ? req.getSchema() : session.defaultSchema;
+            SchemaStore.StoredSchema schema = projector.resolvePinned(collectionName, asserted);
+
+            long generation = req.getGeneration();
+            if (generation == 0) {
+                generation = blockWriter.lastGeneration(collectionName, shardId, docId) + 1;
+            }
+
+            Document stub = projector.projectParentStub(schema, req.getPayload());
+
+            // Children in ordinal order, ids assigned where absent.
+            Integer[] order = new Integer[ordinals.length];
+            for (int i = 0; i < order.length; i++) {
+                order[i] = i;
+            }
+            java.util.Arrays.sort(order, java.util.Comparator.comparingInt(i -> ordinals[i]));
+            List<Document> children = new ArrayList<>(order.length);
+            for (int idx : order) {
+                Chunk chunk = supplied.getChunks(idx);
+                String chunkId = chunk.getChunkId().isEmpty()
+                        ? docId + "#" + generation + "#" + ordinals[idx]
+                        : chunk.getChunkId();
+                children.add(projector.projectChunk(schema, config, chunk, ordinals[idx], chunkId));
+            }
+
+            List<Document> block = BlockJoinDocumentBuilder.build(
+                    docId, generation, stub, children, children.size());
+            BlockWriter.BlockWriteResult result =
+                    blockWriter.writeBlock(collectionName, shardId, docId, generation, block);
+            session.touchedCollections.add(collectionName);
+
+            return BulkIndexResponse.newBuilder()
+                    .setParentAck(ParentAck.newBuilder()
+                            .setClientSeq(seq)
+                            .setDocId(docId)
+                            .setGeneration(generation)
+                            .setChunkCount(result.chunkCount())
+                            .addBlocks(BlockAck.newBuilder()
+                                    .setShardId(shardId)
+                                    .setChunkCount(result.chunkCount())
+                                    .setPurgedDocs(result.purgedDocs())
+                                    .setStatus(com.google.rpc.Status.newBuilder().setCode(CODE_OK).build())
+                                    .build())
+                            .setStatus(com.google.rpc.Status.newBuilder().setCode(CODE_OK).build())
+                            .setChunkCreditsConsumed(result.chunkCount())
+                            .setResolvedSchema(schema.toPin())
+                            .build())
+                    .build();
+        } catch (BlockWriter.StaleGenerationException e) {
+            return parentNack(seq, docId, CODE_ALREADY_EXISTS, e.getMessage());
+        } catch (ParentDocumentProjector.SchemaPinMismatchException e) {
+            return parentNack(seq, docId, CODE_FAILED_PRECONDITION, e.getMessage());
+        } catch (ParentDocumentProjector.InvalidPayloadException
+                 | LuceneFieldEncoder.EncodingException | IllegalArgumentException e) {
+            return parentNack(seq, docId, CODE_INVALID_ARGUMENT, e.getMessage());
+        } catch (Exception e) {
+            LOG.errorf(e, "Parent write %s failed", docId);
+            return parentNack(seq, docId, CODE_INTERNAL, safeMessage(e));
+        }
+    }
+
+    private Uni<BulkIndexResponse> forwardParent(BulkSession session, ShardRouter.Route route,
+                                                 String collectionName, IndexParentDocument req) {
+        session.remoteOwners.put(route.host() + ":" + route.port(), route);
+        IndexParentDocument forwarded = req.toBuilder().setCollection(collectionName).build();
+        MutinyIndexServiceGrpc.MutinyIndexServiceStub stub = MutinyIndexServiceGrpc.newMutinyStub(
+                channelCache.getOrCreate(route.host(), route.port()));
+        return stub.bulkIndex(Multi.createFrom().item(
+                        BulkIndexRequest.newBuilder().setParentDocument(forwarded).build()))
+                .filter(r -> r.getFrameCase() == BulkIndexResponse.FrameCase.PARENT_ACK)
+                .toUni()
+                .ifNoItem().after(REMOTE_TIMEOUT).fail()
+                .onFailure().recoverWithItem(t -> {
+                    LOG.warnf(t, "Forward of parent %s to shard %d owner %s:%d failed",
+                            req.getDocId(), route.shardId(), route.host(), route.port());
+                    return parentNack(req.getClientSeq(), req.getDocId(), CODE_UNAVAILABLE,
+                            "Forward to shard owner failed: " + safeMessage(t));
+                });
+    }
+
+    private static BulkIndexResponse parentNack(long seq, String docId, int code, String message) {
+        return BulkIndexResponse.newBuilder()
+                .setParentAck(ParentAck.newBuilder()
+                        .setClientSeq(seq)
+                        .setDocId(docId)
+                        .setStatus(com.google.rpc.Status.newBuilder()
+                                .setCode(code)
+                                .setMessage(message == null ? "" : message)
+                                .build())
+                        .build())
+                .build();
     }
 
     /** Forwards a document to the remote primary owner of its shard. */
@@ -376,13 +714,23 @@ public class V1Alpha1IndexNodeService implements IndexService {
                     .asRuntimeException());
         }
 
+        boolean documentCentric = config.documentCentric();
         return Uni.createFrom().item(() -> {
             DirectoryReader reader = null;
             try {
                 reader = collectionManager.getReader(request.getCollection(), route.shardId());
                 IndexSearcher searcher = new IndexSearcher(reader);
-                TopDocs topDocs = searcher.search(
-                        new TermQuery(new Term("doc_id", request.getDocId())), 1);
+                // Document-centric collections resolve the PARENT STUB, never
+                // a chunk child that happens to share the doc_id term.
+                org.apache.lucene.search.Query lookup = documentCentric
+                        ? new org.apache.lucene.search.BooleanQuery.Builder()
+                                .add(new TermQuery(new Term("doc_id", request.getDocId())),
+                                        org.apache.lucene.search.BooleanClause.Occur.MUST)
+                                .add(BlockJoinFields.PARENT_QUERY,
+                                        org.apache.lucene.search.BooleanClause.Occur.MUST)
+                                .build()
+                        : new TermQuery(new Term("doc_id", request.getDocId()));
+                TopDocs topDocs = searcher.search(lookup, 1);
                 if (topDocs.scoreDocs.length == 0) {
                     return GetDocumentResponse.newBuilder().setFound(false).build();
                 }
@@ -399,10 +747,27 @@ public class V1Alpha1IndexNodeService implements IndexService {
                         .setFound(true)
                         .setDocId(request.getDocId());
                 for (IndexableField field : doc.getFields()) {
+                    if (field.name().startsWith("_")) {
+                        continue;   // engine-internal fields
+                    }
                     resp.addFields(DocumentField.newBuilder()
                             .setName(field.name())
                             .addValues(toFieldValue(field))
                             .build());
+                }
+
+                if (documentCentric) {
+                    org.apache.lucene.util.BytesRef payload = reader.storedFields()
+                            .document(topDocs.scoreDocs[0].doc)
+                            .getBinaryValue(BlockJoinFields.PARENT_PAYLOAD);
+                    if (payload != null) {
+                        resp.setTypedDocument(com.google.protobuf.Any.parseFrom(
+                                com.google.protobuf.ByteString.copyFrom(
+                                        payload.bytes, payload.offset, payload.length)));
+                    }
+                    if (request.getIncludeChunks()) {
+                        addChunks(resp, searcher, reader, request.getDocId(), config);
+                    }
                 }
                 return resp.build();
             } catch (IndexNotFoundException e) {
@@ -422,6 +787,109 @@ public class V1Alpha1IndexNodeService implements IndexService {
                     }
                 }
             }
+        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+    }
+
+    /** Reassembles the parent's Chunk list from its child documents, ordinal order. */
+    private static void addChunks(GetDocumentResponse.Builder resp, IndexSearcher searcher,
+                                  DirectoryReader reader, String docId,
+                                  CollectionConfig config) throws IOException {
+        org.apache.lucene.search.Query children = new org.apache.lucene.search.BooleanQuery.Builder()
+                .add(new TermQuery(new Term("doc_id", docId)),
+                        org.apache.lucene.search.BooleanClause.Occur.MUST)
+                .add(BlockJoinFields.PARENT_QUERY,
+                        org.apache.lucene.search.BooleanClause.Occur.MUST_NOT)
+                .build();
+        TopDocs childDocs = searcher.search(children, config.maxChunksPerDocument(),
+                new org.apache.lucene.search.Sort(new org.apache.lucene.search.SortField(
+                        BlockJoinFields.CHUNK_ORD, org.apache.lucene.search.SortField.Type.LONG)));
+        for (org.apache.lucene.search.ScoreDoc sd : childDocs.scoreDocs) {
+            Document child = reader.storedFields().document(sd.doc);
+            Chunk.Builder chunk = Chunk.newBuilder();
+            String chunkId = child.get(BlockJoinFields.CHUNK_ID);
+            if (chunkId != null) {
+                chunk.setChunkId(chunkId);
+            }
+            IndexableField ordinal = child.getField(BlockJoinFields.CHUNK_ORD);
+            if (ordinal != null && ordinal.numericValue() != null) {
+                chunk.setOrdinal(ordinal.numericValue().intValue());
+            }
+            IndexableField start = child.getField(BlockJoinFields.CHUNK_START);
+            if (start != null && start.numericValue() != null) {
+                chunk.setStartOffset(start.numericValue().intValue());
+            }
+            IndexableField end = child.getField(BlockJoinFields.CHUNK_END);
+            if (end != null && end.numericValue() != null) {
+                chunk.setEndOffset(end.numericValue().intValue());
+            }
+            org.apache.lucene.util.BytesRef payload =
+                    child.getBinaryValue(BlockJoinFields.CHUNK_PAYLOAD);
+            if (payload != null) {
+                chunk.setPayload(com.google.protobuf.Any.parseFrom(
+                        com.google.protobuf.ByteString.copyFrom(
+                                payload.bytes, payload.offset, payload.length)));
+            }
+            resp.addChunks(chunk.build());
+        }
+    }
+
+    @Override
+    public Uni<DeleteParentDocumentResponse> deleteParentDocument(DeleteParentDocumentRequest request) {
+        CollectionConfig config = collectionManager.getConfig(request.getCollection());
+        if (config == null) {
+            return Uni.createFrom().failure(io.grpc.Status.NOT_FOUND
+                    .withDescription("Collection not found: " + request.getCollection())
+                    .asRuntimeException());
+        }
+        if (!config.documentCentric()) {
+            return Uni.createFrom().failure(io.grpc.Status.FAILED_PRECONDITION
+                    .withDescription("Collection '" + request.getCollection()
+                            + "' is not document-centric")
+                    .asRuntimeException());
+        }
+        if (request.getDocId().isEmpty()) {
+            return Uni.createFrom().failure(io.grpc.Status.INVALID_ARGUMENT
+                    .withDescription("doc_id is required")
+                    .asRuntimeException());
+        }
+
+        return Uni.createFrom().item(() -> {
+            List<Integer> shards = new ArrayList<>();
+            if (request.getShardsCount() > 0) {
+                request.getShardsList().forEach(shards::add);
+            } else {
+                for (int i = 0; i < config.numShards(); i++) {
+                    shards.add(i);
+                }
+            }
+
+            DeleteParentDocumentResponse.Builder resp = DeleteParentDocumentResponse.newBuilder();
+            int blocksDeleted = 0;
+            for (int shardId : shards) {
+                try {
+                    int purged = blockWriter.purgeParent(request.getCollection(), shardId,
+                            request.getDocId(), request.getBelowGeneration());
+                    if (purged > 0) {
+                        blocksDeleted++;
+                    }
+                    resp.addBlocks(BlockAck.newBuilder()
+                            .setShardId(shardId)
+                            .setPurgedDocs(purged)
+                            .setStatus(com.google.rpc.Status.newBuilder().setCode(CODE_OK).build())
+                            .build());
+                } catch (IOException e) {
+                    LOG.errorf(e, "Purge of parent %s on shard %d failed",
+                            request.getDocId(), shardId);
+                    resp.addBlocks(BlockAck.newBuilder()
+                            .setShardId(shardId)
+                            .setStatus(com.google.rpc.Status.newBuilder()
+                                    .setCode(CODE_INTERNAL)
+                                    .setMessage(safeMessage(e))
+                                    .build())
+                            .build());
+                }
+            }
+            return resp.setBlocksDeleted(blocksDeleted).build();
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 

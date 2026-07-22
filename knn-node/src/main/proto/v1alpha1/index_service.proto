@@ -38,6 +38,14 @@ service IndexService {
 
   // Deletes a document by id.
   rpc DeleteDocument (DeleteDocumentRequest) returns (DeleteDocumentResponse);
+
+  // Deletes every block of a parent across every shard (document-centric
+  // collections). Idempotent: deleting an absent parent returns
+  // blocks_deleted = 0 with OK. Also the repair primitive for a crashed
+  // re-chunk and the compensating action for a partially-failed parent
+  // write.
+  rpc DeleteParentDocument (DeleteParentDocumentRequest)
+      returns (DeleteParentDocumentResponse);
 }
 
 // One client->server frame of a BulkIndex stream.
@@ -47,6 +55,9 @@ message BulkIndexRequest {
     BulkOptions options = 1;
     IndexDocument document = 2;
     FlushMarker flush = 3;
+    // Document-centric ingest: one parent fanning out to many chunks across
+    // many shards. Acknowledged with ParentAck, never DocAck.
+    IndexParentDocument parent_document = 4;
   }
 }
 
@@ -54,6 +65,72 @@ message BulkIndexRequest {
 message BulkOptions {
   // Default target collection for documents that leave `collection` empty.
   string collection = 1;
+  // The schema the client compiled against. Must equal the collection pin,
+  // or the stream fails FAILED_PRECONDITION on the FIRST document -- a stale
+  // bulk load fails at frame 1, not at frame 900k.
+  SchemaPin schema = 2;
+  // Default policy for parents that leave `policy` unset.
+  IndexPolicy default_policy = 3;
+}
+
+// A parent document indexed with shard-local block joins. Produces N chunk
+// documents plus one parent stub per participating shard.
+//
+// Distinct from IndexDocument because IndexDocument's contract is
+// upsert-of-one-Lucene-document-by-id, which cannot hold for a write that
+// fans out across shards.
+message IndexParentDocument {
+  // Shares one sequence space with IndexDocument.client_seq.
+  uint64 client_seq = 1;
+  string collection = 2;
+  // REQUIRED and client-stable. Unlike IndexDocument.doc_id, empty is
+  // INVALID_ARGUMENT: delete-by-parent and idempotent replay both key on it.
+  string doc_id = 3;
+  // Asserted pin for the parent payload AND every chunk payload.
+  // Unset = BulkOptions.schema; unset in both = the collection pin, echoed
+  // in ParentAck.resolved_schema.
+  SchemaPin schema = 4;
+  // The parent, as the collection's pinned root message, in an Any.
+  // Present in BOTH modes. Projected onto the parent stub (filter metadata
+  // only -- the stub carries no vector).
+  google.protobuf.Any payload = 5;
+
+  oneof mode {
+    ServerChunking server_chunking = 6;   // mode A
+    SuppliedChunks supplied_chunks = 7;   // mode B
+  }
+
+  IndexPolicy policy = 8;
+  // Monotonic generation, making the cross-shard purge order-independent.
+  // 0 = server-assigned. Non-zero is for writers holding an authoritative
+  // version (CDC LSN, event offset); a generation <= the last written for
+  // this parent is ALREADY_EXISTS.
+  uint64 generation = 9;
+}
+
+// Mode A: the server chunks and embeds. This message SELECTS among what the
+// schema pinned; it does not define chunking. Any field that would change
+// the collection's plan_digest is FAILED_PRECONDITION.
+message ServerChunking {
+  // Dotted proto path inside `payload` holding the text to chunk. Empty =
+  // the field the pinned descriptor marks derivable (Representation.derive),
+  // which is the recommended form. Non-empty is a backfill override,
+  // validated against the pinned descriptor.
+  string text_field_path = 1;
+  // Selects among the pinned specs when a collection declares several
+  // derivable representations. Empty = the only one.
+  string representation = 2;
+}
+
+// Mode B: the client supplies chunks.
+message SuppliedChunks {
+  // Chunk order defines `ordinal` when every Chunk.ordinal is 0. Mixing
+  // explicit and implicit ordinals is INVALID_ARGUMENT.
+  repeated Chunk chunks = 1;
+  // True: chunks with no vector are embedded server-side with the pinned
+  // model. False (default): an unset vector is INVALID_ARGUMENT -- silence
+  // would index a chunk that can never match a vector query.
+  bool embed_missing_vectors = 2;
 }
 
 // A single document to index. Indexing is upsert-by-id: an existing
@@ -92,7 +169,42 @@ message BulkIndexResponse {
     DocAck ack = 1;
     FlowControl flow_control = 2;
     FlushAck flush_ack = 3;
+    // Terminal ack for one IndexParentDocument. Exactly one per parent.
+    ParentAck parent_ack = 4;
   }
+}
+
+// Per-parent acknowledgement, terminal for that client_seq. All-or-nothing:
+// status is OK only when every BlockAck is OK. On partial failure the server
+// compensates (deletes the blocks that landed) and reports ABORTED; if
+// compensation itself fails, DATA_LOSS with the shards named.
+//
+// ParentAck and DocAck frames interleave freely and may arrive out of order;
+// correlate by client_seq only.
+message ParentAck {
+  uint64 client_seq = 1;
+  string doc_id = 2;
+  // Generation actually written.
+  uint64 generation = 3;
+  // Chunks written across all shards. In mode A the client did not choose it.
+  int32 chunk_count = 4;
+  // One entry per shard TOUCHED -- both shards that received a block and
+  // shards that only had older generations purged.
+  repeated BlockAck blocks = 5;
+  google.rpc.Status status = 6;
+  // What the parent cost: one document credit and this many chunk credits.
+  uint32 chunk_credits_consumed = 7;
+  // The pin the server projected with.
+  SchemaPin resolved_schema = 8;
+}
+
+message BlockAck {
+  int32 shard_id = 1;
+  // Chunks in the block written to this shard. 0 for a purge-only shard.
+  int32 chunk_count = 2;
+  // Documents removed while replacing older generations.
+  int32 purged_docs = 3;
+  google.rpc.Status status = 4;
 }
 
 // Per-document acknowledgement. OK status means the document was accepted
@@ -130,6 +242,10 @@ message FlowControl {
   uint32 window = 2;
   // Human-readable cause, e.g. "merge backlog on shard 3".
   string detail = 3;
+  // Max un-acked CHUNKS in flight, across IndexDocument and
+  // IndexParentDocument frames. 0 = not enforced. Without this a
+  // 1000-document window admits millions of chunk writes.
+  uint32 chunk_window = 4;
 }
 
 // Durability confirmation for a FlushMarker.
@@ -143,12 +259,19 @@ message GetDocumentRequest {
   string doc_id = 2;
   // Stored fields to return. Empty = all stored fields.
   repeated string fields = 3;
+  // Also return the parent's chunks (document-centric collections only).
+  bool include_chunks = 4;
 }
 
 message GetDocumentResponse {
   bool found = 1;
   string doc_id = 2;
   repeated DocumentField fields = 3;
+  // The stored parent payload re-packed in an Any, when one was indexed via
+  // IndexParentDocument (document-centric collections).
+  google.protobuf.Any typed_document = 4;
+  // Populated when include_chunks was set.
+  repeated Chunk chunks = 5;
 }
 
 message DeleteDocumentRequest {
@@ -159,4 +282,20 @@ message DeleteDocumentRequest {
 message DeleteDocumentResponse {
   // False when no document with that id existed.
   bool found = 1;
+}
+
+message DeleteParentDocumentRequest {
+  string collection = 1;
+  string doc_id = 2;
+  // Restrict fan-out. Empty = every shard (the safe default, and the only
+  // correct choice without a ParentAck in hand).
+  repeated int32 shards = 3;
+  // Delete only generations strictly below this. 0 = all generations.
+  uint64 below_generation = 4;
+}
+
+message DeleteParentDocumentResponse {
+  // Shards on which at least one document was removed.
+  int32 blocks_deleted = 1;
+  repeated BlockAck blocks = 2;
 }

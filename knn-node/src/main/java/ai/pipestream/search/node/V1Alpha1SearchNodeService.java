@@ -43,6 +43,9 @@ public class V1Alpha1SearchNodeService implements SearchService {
     @Inject
     jakarta.enterprise.inject.Instance<MeterRegistry> meterRegistry;
 
+    @Inject
+    ai.pipestream.search.schema.SchemaStore schemaStore;
+
     /** Upper bound on the per-request result window. */
     @org.eclipse.microprofile.config.inject.ConfigProperty(name = "knn.v1alpha1.max-size", defaultValue = "1000")
     int maxSize;
@@ -83,7 +86,7 @@ public class V1Alpha1SearchNodeService implements SearchService {
                     .setContext(SearchContext.newBuilder().setQueryId(queryId).build())
                     .build());
 
-            CollectionSchema schema = toProtoSchema(config);
+            CollectionSchema schema = resolveSchema(collectionName, config);
             int targetSize = request.getSize() > 0 ? Math.min(request.getSize(), maxSize) : 10;
 
             try {
@@ -249,7 +252,7 @@ public class V1Alpha1SearchNodeService implements SearchService {
                         .asRuntimeException();
             }
 
-            CollectionSchema schema = toProtoSchema(config);
+            CollectionSchema schema = resolveSchema(collectionName, config);
             QueryPlan plan = queryCompiler.compile(request.getQuery(), schema);
 
             if (!(plan instanceof QueryPlan.Single single)) {
@@ -290,6 +293,17 @@ public class V1Alpha1SearchNodeService implements SearchService {
                 }
             }
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+    }
+
+    /**
+     * The registered proto schema when one exists (the schema plane must
+     * reach the read path), else the synthesized two-field fallback for
+     * collections created without one.
+     */
+    private CollectionSchema resolveSchema(String collectionName, CollectionConfig config) {
+        return schemaStore.get(collectionName)
+                .map(stored -> stored.compiled().toProto())
+                .orElseGet(() -> toProtoSchema(config));
     }
 
     private static CollectionSchema toProtoSchema(CollectionConfig config) {

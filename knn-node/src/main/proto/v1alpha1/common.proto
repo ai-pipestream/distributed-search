@@ -16,6 +16,7 @@ syntax = "proto3";
 
 package ai.pipestream.search.v1alpha1;
 
+import "google/protobuf/any.proto";
 import "google/protobuf/timestamp.proto";
 import "google/rpc/status.proto";
 
@@ -508,6 +509,54 @@ message FieldSchema {
   }
   // Store the original value for retrieval on hits.
   bool stored = 15;
+}
+
+// ---------------------------------------------------------------------------
+// Chunks (document-centric collections)
+// ---------------------------------------------------------------------------
+
+// One chunk of a parent document. Both ingest modes converge on this shape:
+// mode A (server chunking) produces them, mode B (supplied chunks) accepts
+// them.
+message Chunk {
+  // Unique within the parent. Empty = server-assigned
+  // "<doc_id>#<generation>#<ordinal>".
+  string chunk_id = 1;
+  // 0-based position in the parent's chunk sequence.
+  int32 ordinal = 2;
+  // The chunk body as the collection's pinned chunk message, in an Any.
+  // The type_url CONFIRMS the pinned chunk message; it never selects one.
+  google.protobuf.Any payload = 3;
+  // Pre-computed embedding. Unset = server embeds (see
+  // SuppliedChunks.embed_missing_vectors).
+  Vector vector = 4;
+  // Target vector field, "<field>#<representation>". Empty = the single
+  // VECTOR representation; INVALID_ARGUMENT when the schema has more than
+  // one.
+  string vector_field = 5;
+  // Char span of this chunk in the parent's chunk-source text. Server-filled
+  // in mode A; optional and echoed in mode B.
+  int32 start_offset = 6;
+  int32 end_offset = 7;
+}
+
+// Placement and replacement policy for a parent document.
+message IndexPolicy {
+  enum Placement {
+    PLACEMENT_UNSPECIFIED = 0;
+    // Balance-constrained similarity clustering, rotated by hash(doc_id).
+    PLACEMENT_BALANCED_SIMILARITY = 1;
+    // Contiguous runs by chunk ordinal.
+    PLACEMENT_CONTIGUOUS = 2;
+    // Whole document in one block on hash(doc_id) mod S. The only placement
+    // whose write is atomic.
+    PLACEMENT_SINGLE_SHARD = 3;
+  }
+  Placement placement = 1;
+  // Hard cap; 0 = the collection's max_chunks_per_document (default 4096).
+  // Enforced BEFORE embedding: a pathological document costs one chunking
+  // pass, not thousands of embed calls.
+  int32 max_chunks = 2;
 }
 
 // Immutable schema identity. Collections pin one; writers assert one.

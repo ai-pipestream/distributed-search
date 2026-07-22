@@ -246,8 +246,9 @@ public class V1Alpha1IndexProtocolTest {
                     .filter(r -> r.getFrameCase() == BulkIndexResponse.FrameCase.ACK)
                     .map(BulkIndexResponse::getAck)
                     .toList();
-            Assertions.assertEquals(12, acks.get(0).getStatus().getCode(),
-                    "typed_document alone must be UNIMPLEMENTED until descriptor-backed ingest lands");
+            Assertions.assertEquals(9, acks.get(0).getStatus().getCode(),
+                    "typed_document without a registered proto schema must be FAILED_PRECONDITION, "
+                            + "never an OK ack for discarded input");
             Assertions.assertEquals(3, acks.get(1).getStatus().getCode(),
                     "setting both fields and typed_document must be INVALID_ARGUMENT");
         } finally {

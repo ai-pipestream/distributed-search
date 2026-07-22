@@ -3,8 +3,6 @@ package ai.pipestream.search.schema;
 import ai.pipestream.search.v1alpha1.SchemaPin;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.ByteString;
-import com.google.protobuf.DescriptorProtos.DescriptorProto;
-import com.google.protobuf.DescriptorProtos.FileDescriptorProto;
 import com.google.protobuf.DescriptorProtos.FileDescriptorSet;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -49,13 +47,26 @@ public class SchemaStore {
     /** Everything the engine knows about one collection's registered schema. */
     public record StoredSchema(String rootMessage, String chunkMessage,
                                byte[] descriptorBytes, byte[] descriptorDigest,
-                               byte[] planDigest, CompiledSchema compiled) {
+                               byte[] planDigest, CompiledSchema compiled,
+                               Map<String, com.google.protobuf.Descriptors.Descriptor> messagePool) {
 
         public SchemaPin toPin() {
             return SchemaPin.newBuilder()
                     .setDescriptorDigest(ByteString.copyFrom(descriptorDigest))
                     .setPlanDigest(ByteString.copyFrom(planDigest))
                     .build();
+        }
+
+        /** The pinned message descriptor by fully qualified name, if defined. */
+        public Optional<com.google.protobuf.Descriptors.Descriptor> message(String fqName) {
+            return Optional.ofNullable(messagePool.get(fqName));
+        }
+
+        /** True when an asserted pin matches this schema's identity. */
+        public boolean matches(SchemaPin asserted) {
+            return java.util.Arrays.equals(asserted.getDescriptorDigest().toByteArray(), descriptorDigest)
+                    && (asserted.getPlanDigest().isEmpty()
+                        || java.util.Arrays.equals(asserted.getPlanDigest().toByteArray(), planDigest));
         }
     }
 
@@ -142,41 +153,33 @@ public class SchemaStore {
         if (result.schema().fields().isEmpty()) {
             throw new IllegalArgumentException("Schema compiled to zero indexable fields");
         }
-        if (chunkMessage != null && !chunkMessage.isEmpty() && !containsMessage(set, chunkMessage)) {
+
+        // The descriptor pool DynamicMessage unpacks Any payloads against.
+        Map<String, com.google.protobuf.Descriptors.Descriptor> pool = new java.util.HashMap<>();
+        for (com.google.protobuf.Descriptors.FileDescriptor fd
+                : SchemaCompiler.buildFileDescriptors(set).values()) {
+            collectMessages(fd.getMessageTypes(), pool);
+        }
+        if (chunkMessage != null && !chunkMessage.isEmpty() && !pool.containsKey(chunkMessage)) {
             throw new IllegalArgumentException(
                     "chunk_message '" + chunkMessage + "' is not defined in the descriptor set");
         }
+
         byte[] descriptorDigest = sha256(descriptorBytes);
         // v1 plan canonicalization: the compiled schema's deterministic wire
         // projection. The effective ChunkSpec folds in with mode-A ingest.
         byte[] planDigest = sha256(result.schema().toProto().toByteArray());
         return new StoredSchema(rootMessage, chunkMessage == null ? "" : chunkMessage,
-                descriptorBytes, descriptorDigest, planDigest, result.schema());
+                descriptorBytes, descriptorDigest, planDigest, result.schema(),
+                Map.copyOf(pool));
     }
 
-    /** True when the set defines the fully qualified message (nested included). */
-    static boolean containsMessage(FileDescriptorSet set, String fqName) {
-        for (FileDescriptorProto file : set.getFileList()) {
-            String prefix = file.getPackage().isEmpty() ? "" : file.getPackage() + ".";
-            for (DescriptorProto message : file.getMessageTypeList()) {
-                if (containsMessage(prefix + message.getName(), message, fqName)) {
-                    return true;
-                }
-            }
+    private static void collectMessages(java.util.List<com.google.protobuf.Descriptors.Descriptor> messages,
+                                        Map<String, com.google.protobuf.Descriptors.Descriptor> pool) {
+        for (com.google.protobuf.Descriptors.Descriptor d : messages) {
+            pool.put(d.getFullName(), d);
+            collectMessages(d.getNestedTypes(), pool);
         }
-        return false;
-    }
-
-    private static boolean containsMessage(String fqn, DescriptorProto message, String target) {
-        if (fqn.equals(target)) {
-            return true;
-        }
-        for (DescriptorProto nested : message.getNestedTypeList()) {
-            if (containsMessage(fqn + "." + nested.getName(), nested, target)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     static byte[] sha256(byte[] bytes) {
