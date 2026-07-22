@@ -19,7 +19,10 @@ repositories {
     maven {
         url = uri('https://git.rokkon.com/api/packages/ai-pipestream/maven')
         content {
-            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp|protomolt)(-.*)?')
+            // Deliberately NOT protomolt: this registry holds an old manual
+            // protomolt push, and any repo that can serve the module may win
+            // on a cached runner. Protomolt snapshots come from Central only.
+            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp)(-.*)?')
         }
     }
     mavenCentral()
