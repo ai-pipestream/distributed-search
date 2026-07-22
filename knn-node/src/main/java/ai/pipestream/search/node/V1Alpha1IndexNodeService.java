@@ -69,6 +69,9 @@ public class V1Alpha1IndexNodeService implements IndexService {
     /** Initial credit window granted before any client frame is consumed. */
     private static final int INITIAL_WINDOW = 1000;
 
+    /** Max un-acked chunks in flight (IndexDocument + IndexParentDocument). */
+    private static final int INITIAL_CHUNK_WINDOW = 100_000;
+
     private static final Duration REMOTE_TIMEOUT = Duration.ofSeconds(30);
 
     // com.google.rpc.Code values used in DocAck.status.
@@ -115,12 +118,15 @@ public class V1Alpha1IndexNodeService implements IndexService {
         BulkSession session = new BulkSession();
 
         // The proto mandates the server sends the initial credit grant first,
-        // regardless of whether the client opens with BulkOptions.
+        // regardless of whether the client opens with BulkOptions. The chunk
+        // window bounds parent fan-out: a 1000-document window would
+        // otherwise admit millions of chunk writes.
         Multi<BulkIndexResponse> initialGrant = Multi.createFrom().item(
                 BulkIndexResponse.newBuilder()
                         .setFlowControl(FlowControl.newBuilder()
                                 .setState(FlowControl.State.STATE_READY)
                                 .setWindow(INITIAL_WINDOW)
+                                .setChunkWindow(INITIAL_CHUNK_WINDOW)
                                 .setDetail("initial credit grant")
                                 .build())
                         .build());
@@ -455,11 +461,20 @@ public class V1Alpha1IndexNodeService implements IndexService {
                     "Chunk ordinals must be either all-implicit (all zero) or explicit and distinct"));
         }
 
-        IndexPolicy.Placement placement = effectivePlacement(session, req);
-        if (placement == IndexPolicy.Placement.PLACEMENT_BALANCED_SIMILARITY
-                || placement == IndexPolicy.Placement.PLACEMENT_CONTIGUOUS) {
+        IndexPolicy.Placement placement = effectivePlacement(session, config, req);
+        if (placement == IndexPolicy.Placement.PLACEMENT_CONTIGUOUS) {
             return Uni.createFrom().item(parentNack(seq, docId, CODE_UNIMPLEMENTED,
-                    "Multi-shard placement is not implemented yet; use PLACEMENT_SINGLE_SHARD"));
+                    "PLACEMENT_CONTIGUOUS is not implemented yet"));
+        }
+        if (placement == IndexPolicy.Placement.PLACEMENT_BALANCED_SIMILARITY) {
+            if (config.numShards() > 1 && !shardRouter.allShardsLocal()) {
+                return Uni.createFrom().item(parentNack(seq, docId, CODE_UNIMPLEMENTED,
+                        "Balanced placement across remote shard owners is not supported yet"));
+            }
+            return Uni.createFrom()
+                    .item(() -> writeParentBalanced(session, config, collectionName, docId,
+                            req, supplied, ordinals))
+                    .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
         }
 
         ShardRouter.Route route = shardRouter.route(collectionName, config.numShards(), docId);
@@ -500,7 +515,9 @@ public class V1Alpha1IndexNodeService implements IndexService {
         return ordinals;
     }
 
-    private static IndexPolicy.Placement effectivePlacement(BulkSession session, IndexParentDocument req) {
+    private static IndexPolicy.Placement effectivePlacement(BulkSession session,
+                                                            CollectionConfig config,
+                                                            IndexParentDocument req) {
         if (req.hasPolicy() && req.getPolicy().getPlacement() != IndexPolicy.Placement.PLACEMENT_UNSPECIFIED) {
             return req.getPolicy().getPlacement();
         }
@@ -509,7 +526,169 @@ public class V1Alpha1IndexNodeService implements IndexService {
                 && sessionDefault.getPlacement() != IndexPolicy.Placement.PLACEMENT_UNSPECIFIED) {
             return sessionDefault.getPlacement();
         }
-        return IndexPolicy.Placement.PLACEMENT_SINGLE_SHARD;
+        // Collection default: balanced similarity clustering for
+        // document-centric collections created with that placement mode.
+        return config.placement() == CollectionConfig.PlacementMode.BALANCED_SIMILARITY
+                ? IndexPolicy.Placement.PLACEMENT_BALANCED_SIMILARITY
+                : IndexPolicy.Placement.PLACEMENT_SINGLE_SHARD;
+    }
+
+    /**
+     * Balanced multi-shard fan-out: chunks cluster by similarity across
+     * shards (cap ceil(n/S)), each occupied shard gets a block, every other
+     * shard gets a generation-bounded purge. All-or-nothing per parent:
+     * a mid-fan-out failure compensates by deleting the blocks that landed
+     * and reports ABORTED (DATA_LOSS when compensation itself fails).
+     */
+    private BulkIndexResponse writeParentBalanced(BulkSession session, CollectionConfig config,
+                                                  String collectionName, String docId,
+                                                  IndexParentDocument req, SuppliedChunks supplied,
+                                                  int[] ordinals) {
+        long seq = req.getClientSeq();
+        try {
+            SchemaPin asserted = req.hasSchema() ? req.getSchema() : session.defaultSchema;
+            SchemaStore.StoredSchema schema = projector.resolvePinned(collectionName, asserted);
+
+            // Chunks in ordinal order (placement and block layout both use it).
+            Integer[] order = new Integer[ordinals.length];
+            for (int i = 0; i < order.length; i++) {
+                order[i] = i;
+            }
+            java.util.Arrays.sort(order, java.util.Comparator.comparingInt(i -> ordinals[i]));
+            List<Chunk> chunksInOrder = new ArrayList<>(order.length);
+            List<float[]> vectors = new ArrayList<>(order.length);
+            int[] ordinalByPosition = new int[order.length];
+            for (int position = 0; position < order.length; position++) {
+                Chunk chunk = supplied.getChunks(order[position]);
+                chunksInOrder.add(chunk);
+                ordinalByPosition[position] = ordinals[order[position]];
+                float[] vector = new float[chunk.getVector().getValuesCount()];
+                for (int i = 0; i < vector.length; i++) {
+                    vector[i] = chunk.getVector().getValues(i);
+                }
+                vectors.add(vector);
+            }
+
+            ai.pipestream.search.index.placement.ChunkPlacement placement =
+                    new ai.pipestream.search.index.placement.BalancedNearestNeighbourChainPlacement()
+                            .place(new ai.pipestream.search.index.placement.PlacementRequest(
+                                    docId, vectors, config.numShards(), config.similarity()));
+
+            // Generation: monotonic across ALL shards of this parent.
+            long lastGeneration = 0;
+            for (int shard = 0; shard < config.numShards(); shard++) {
+                lastGeneration = Math.max(lastGeneration,
+                        blockWriter.lastGeneration(collectionName, shard, docId));
+            }
+            long generation = req.getGeneration() != 0 ? req.getGeneration() : lastGeneration + 1;
+            if (lastGeneration >= generation) {
+                return parentNack(seq, docId, CODE_ALREADY_EXISTS, "Parent '" + docId
+                        + "' already has generation " + lastGeneration + " >= " + generation);
+            }
+
+            // Phase 1 (validation): project EVERY block before any write, so
+            // payload problems are INVALID_ARGUMENT with zero index mutations.
+            Map<Integer, int[]> occupied = placement.occupiedShards();
+            int totalChunks = chunksInOrder.size();
+            Map<Integer, List<Document>> blocksByShard = new java.util.LinkedHashMap<>();
+            for (Map.Entry<Integer, int[]> entry : occupied.entrySet()) {
+                int shardId = entry.getKey();
+                List<Document> children = new ArrayList<>(entry.getValue().length);
+                for (int position : positionsFor(placement.shardOfChunk(), shardId)) {
+                    Chunk chunk = chunksInOrder.get(position);
+                    int ordinal = ordinalByPosition[position];
+                    String chunkId = chunk.getChunkId().isEmpty()
+                            ? docId + "#" + generation + "#" + ordinal
+                            : chunk.getChunkId();
+                    children.add(projector.projectChunk(schema, config, chunk, ordinal, chunkId));
+                }
+                Document stub = projector.projectParentStub(schema, req.getPayload());
+                blocksByShard.put(shardId, BlockJoinDocumentBuilder.build(
+                        docId, generation, stub, children, totalChunks));
+            }
+
+            // Phase 2 (committed): fan out. From here on a failure compensates.
+            List<BlockAck> blocks = new ArrayList<>();
+            List<Integer> writtenShards = new ArrayList<>();
+            try {
+                for (Map.Entry<Integer, List<Document>> entry : blocksByShard.entrySet()) {
+                    int shardId = entry.getKey();
+                    BlockWriter.BlockWriteResult result = blockWriter.writeBlock(
+                            collectionName, shardId, docId, generation, entry.getValue());
+                    writtenShards.add(shardId);
+                    blocks.add(BlockAck.newBuilder()
+                            .setShardId(shardId)
+                            .setChunkCount(result.chunkCount())
+                            .setPurgedDocs(result.purgedDocs())
+                            .setStatus(com.google.rpc.Status.newBuilder().setCode(CODE_OK).build())
+                            .build());
+                }
+                // Purge older generations off shards this placement skipped.
+                for (int shardId = 0; shardId < config.numShards(); shardId++) {
+                    if (occupied.containsKey(shardId)) {
+                        continue;
+                    }
+                    int purged = blockWriter.purgeParent(collectionName, shardId, docId, generation);
+                    if (purged > 0) {
+                        blocks.add(BlockAck.newBuilder()
+                                .setShardId(shardId)
+                                .setPurgedDocs(purged)
+                                .setStatus(com.google.rpc.Status.newBuilder().setCode(CODE_OK).build())
+                                .build());
+                    }
+                }
+            } catch (Exception e) {
+                LOG.errorf(e, "Parent %s fan-out failed after %d block(s); compensating",
+                        docId, writtenShards.size());
+                try {
+                    for (int shardId : writtenShards) {
+                        blockWriter.deleteGeneration(collectionName, shardId, docId, generation);
+                    }
+                } catch (Exception compensation) {
+                    LOG.errorf(compensation, "Compensation for parent %s FAILED", docId);
+                    return parentNack(seq, docId, 15 /* DATA_LOSS */,
+                            "Partial write could not be compensated on shards " + writtenShards
+                                    + ": " + safeMessage(compensation));
+                }
+                return parentNack(seq, docId, 10 /* ABORTED */,
+                        "Fan-out failed (" + safeMessage(e) + "); all blocks were rolled back");
+            }
+
+            session.touchedCollections.add(collectionName);
+            return BulkIndexResponse.newBuilder()
+                    .setParentAck(ParentAck.newBuilder()
+                            .setClientSeq(seq)
+                            .setDocId(docId)
+                            .setGeneration(generation)
+                            .setChunkCount(totalChunks)
+                            .addAllBlocks(blocks)
+                            .setStatus(com.google.rpc.Status.newBuilder().setCode(CODE_OK).build())
+                            .setChunkCreditsConsumed(totalChunks)
+                            .setResolvedSchema(schema.toPin())
+                            .build())
+                    .build();
+        } catch (BlockWriter.StaleGenerationException e) {
+            return parentNack(seq, docId, CODE_ALREADY_EXISTS, e.getMessage());
+        } catch (ParentDocumentProjector.SchemaPinMismatchException e) {
+            return parentNack(seq, docId, CODE_FAILED_PRECONDITION, e.getMessage());
+        } catch (ParentDocumentProjector.InvalidPayloadException
+                 | LuceneFieldEncoder.EncodingException | IllegalArgumentException e) {
+            return parentNack(seq, docId, CODE_INVALID_ARGUMENT, e.getMessage());
+        } catch (Exception e) {
+            LOG.errorf(e, "Parent write %s failed", docId);
+            return parentNack(seq, docId, CODE_INTERNAL, safeMessage(e));
+        }
+    }
+
+    /** Positions (in ordinal-sorted chunk order) landing on one shard, ascending. */
+    private static List<Integer> positionsFor(int[] shardOfChunk, int shardId) {
+        List<Integer> positions = new ArrayList<>();
+        for (int position = 0; position < shardOfChunk.length; position++) {
+            if (shardOfChunk[position] == shardId) {
+                positions.add(position);
+            }
+        }
+        return positions;
     }
 
     private BulkIndexResponse writeParentLocal(BulkSession session, CollectionConfig config,
@@ -701,6 +880,13 @@ public class V1Alpha1IndexNodeService implements IndexService {
                     .asRuntimeException());
         }
 
+        if (config.documentCentric()) {
+            // Balanced placement: the stub lives on placement-chosen shards,
+            // not hash(doc_id) — scan every shard.
+            return Uni.createFrom().item(() -> getParentDocument(request, config))
+                    .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        }
+
         ShardRouter.Route route = shardRouter.route(
                 request.getCollection(), config.numShards(), request.getDocId());
         if (route.target() == ShardRouter.Route.Target.REMOTE) {
@@ -714,23 +900,13 @@ public class V1Alpha1IndexNodeService implements IndexService {
                     .asRuntimeException());
         }
 
-        boolean documentCentric = config.documentCentric();
         return Uni.createFrom().item(() -> {
             DirectoryReader reader = null;
             try {
                 reader = collectionManager.getReader(request.getCollection(), route.shardId());
                 IndexSearcher searcher = new IndexSearcher(reader);
-                // Document-centric collections resolve the PARENT STUB, never
-                // a chunk child that happens to share the doc_id term.
-                org.apache.lucene.search.Query lookup = documentCentric
-                        ? new org.apache.lucene.search.BooleanQuery.Builder()
-                                .add(new TermQuery(new Term("doc_id", request.getDocId())),
-                                        org.apache.lucene.search.BooleanClause.Occur.MUST)
-                                .add(BlockJoinFields.PARENT_QUERY,
-                                        org.apache.lucene.search.BooleanClause.Occur.MUST)
-                                .build()
-                        : new TermQuery(new Term("doc_id", request.getDocId()));
-                TopDocs topDocs = searcher.search(lookup, 1);
+                TopDocs topDocs = searcher.search(
+                        new TermQuery(new Term("doc_id", request.getDocId())), 1);
                 if (topDocs.scoreDocs.length == 0) {
                     return GetDocumentResponse.newBuilder().setFound(false).build();
                 }
@@ -755,20 +931,6 @@ public class V1Alpha1IndexNodeService implements IndexService {
                             .addValues(toFieldValue(field))
                             .build());
                 }
-
-                if (documentCentric) {
-                    org.apache.lucene.util.BytesRef payload = reader.storedFields()
-                            .document(topDocs.scoreDocs[0].doc)
-                            .getBinaryValue(BlockJoinFields.PARENT_PAYLOAD);
-                    if (payload != null) {
-                        resp.setTypedDocument(com.google.protobuf.Any.parseFrom(
-                                com.google.protobuf.ByteString.copyFrom(
-                                        payload.bytes, payload.offset, payload.length)));
-                    }
-                    if (request.getIncludeChunks()) {
-                        addChunks(resp, searcher, reader, request.getDocId(), config);
-                    }
-                }
                 return resp.build();
             } catch (IndexNotFoundException e) {
                 // Empty shard: a successful lookup that matched nothing.
@@ -790,10 +952,93 @@ public class V1Alpha1IndexNodeService implements IndexService {
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
-    /** Reassembles the parent's Chunk list from its child documents, ordinal order. */
-    private static void addChunks(GetDocumentResponse.Builder resp, IndexSearcher searcher,
-                                  DirectoryReader reader, String docId,
-                                  CollectionConfig config) throws IOException {
+    /**
+     * Document-centric lookup: the parent stub is on whichever shards the
+     * placement chose; chunks may span several shards. Scans every shard,
+     * returns the payload from the first stub found and the chunk list
+     * merged across shards in ordinal order.
+     */
+    private GetDocumentResponse getParentDocument(GetDocumentRequest request,
+                                                  CollectionConfig config) {
+        GetDocumentResponse.Builder resp = GetDocumentResponse.newBuilder()
+                .setDocId(request.getDocId());
+        boolean found = false;
+        List<Chunk> chunks = new ArrayList<>();
+        org.apache.lucene.search.Query stubLookup = new org.apache.lucene.search.BooleanQuery.Builder()
+                .add(new TermQuery(new Term("doc_id", request.getDocId())),
+                        org.apache.lucene.search.BooleanClause.Occur.MUST)
+                .add(BlockJoinFields.PARENT_QUERY,
+                        org.apache.lucene.search.BooleanClause.Occur.MUST)
+                .build();
+
+        for (int shardId = 0; shardId < config.numShards(); shardId++) {
+            DirectoryReader reader = null;
+            try {
+                try {
+                    reader = collectionManager.getReader(request.getCollection(), shardId);
+                } catch (IndexNotFoundException e) {
+                    continue;   // empty shard
+                }
+                IndexSearcher searcher = new IndexSearcher(reader);
+                TopDocs stubs = searcher.search(stubLookup, 1);
+                if (stubs.scoreDocs.length > 0 && !found) {
+                    found = true;
+                    Document stub = reader.storedFields().document(stubs.scoreDocs[0].doc);
+                    for (IndexableField field : stub.getFields()) {
+                        if (field.name().startsWith("_")) {
+                            continue;
+                        }
+                        if (request.getFieldsCount() > 0
+                                && !request.getFieldsList().contains(field.name())) {
+                            continue;
+                        }
+                        resp.addFields(DocumentField.newBuilder()
+                                .setName(field.name())
+                                .addValues(toFieldValue(field))
+                                .build());
+                    }
+                    org.apache.lucene.util.BytesRef payload =
+                            stub.getBinaryValue(BlockJoinFields.PARENT_PAYLOAD);
+                    if (payload != null) {
+                        resp.setTypedDocument(com.google.protobuf.Any.parseFrom(
+                                com.google.protobuf.ByteString.copyFrom(
+                                        payload.bytes, payload.offset, payload.length)));
+                    }
+                }
+                if (request.getIncludeChunks()) {
+                    collectChunks(chunks, searcher, reader, request.getDocId(), config);
+                }
+            } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+                LOG.warnf(e, "Stored payload for %s failed to parse", request.getDocId());
+            } catch (IOException e) {
+                LOG.errorf(e, "Get parent document %s failed on shard %d",
+                        request.getDocId(), shardId);
+                throw io.grpc.Status.INTERNAL
+                        .withDescription("Get document failed: " + safeMessage(e))
+                        .asRuntimeException();
+            } finally {
+                if (reader != null) {
+                    try {
+                        collectionManager.releaseReader(reader);
+                    } catch (IOException ignored) {
+                        // release failures are non-fatal
+                    }
+                }
+            }
+        }
+
+        if (!found) {
+            return GetDocumentResponse.newBuilder().setFound(false).build();
+        }
+        chunks.sort(java.util.Comparator.comparingInt(Chunk::getOrdinal));
+        resp.addAllChunks(chunks);
+        return resp.setFound(true).build();
+    }
+
+    /** Reassembles Chunk entries from one shard's child documents. */
+    private static void collectChunks(List<Chunk> into, IndexSearcher searcher,
+                                      DirectoryReader reader, String docId,
+                                      CollectionConfig config) throws IOException {
         org.apache.lucene.search.Query children = new org.apache.lucene.search.BooleanQuery.Builder()
                 .add(new TermQuery(new Term("doc_id", docId)),
                         org.apache.lucene.search.BooleanClause.Occur.MUST)
@@ -829,7 +1074,7 @@ public class V1Alpha1IndexNodeService implements IndexService {
                         com.google.protobuf.ByteString.copyFrom(
                                 payload.bytes, payload.offset, payload.length)));
             }
-            resp.addChunks(chunk.build());
+            into.add(chunk.build());
         }
     }
 
@@ -912,6 +1157,25 @@ public class V1Alpha1IndexNodeService implements IndexService {
             return Uni.createFrom().failure(io.grpc.Status.NOT_FOUND
                     .withDescription("Collection not found: " + request.getCollection())
                     .asRuntimeException());
+        }
+
+        if (config.documentCentric()) {
+            // The whole block, wherever placement put its pieces.
+            return Uni.createFrom().item(() -> {
+                try {
+                    boolean found = false;
+                    for (int shardId = 0; shardId < config.numShards(); shardId++) {
+                        found |= blockWriter.purgeParent(request.getCollection(), shardId,
+                                request.getDocId(), 0) > 0;
+                    }
+                    return DeleteDocumentResponse.newBuilder().setFound(found).build();
+                } catch (IOException e) {
+                    LOG.errorf(e, "Delete parent %s failed", request.getDocId());
+                    throw io.grpc.Status.INTERNAL
+                            .withDescription("Delete failed: " + safeMessage(e))
+                            .asRuntimeException();
+                }
+            }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
         }
 
         ShardRouter.Route route = shardRouter.route(

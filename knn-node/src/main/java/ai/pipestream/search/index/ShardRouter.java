@@ -66,6 +66,15 @@ public class ShardRouter {
     }
 
     /**
+     * True when every shard of every collection is served by this node
+     * (single-node mode or cluster membership disabled). Multi-shard block
+     * fan-out currently requires this.
+     */
+    public boolean allShardsLocal() {
+        return singleNode || !clusterBootstrap.isEnabled();
+    }
+
+    /**
      * Decides placement for one document id. LOCAL in single-node mode, when
      * the cluster is disabled, or when this node owns the target shard;
      * REMOTE when a primary owner is advertising the shard; NO_OWNER otherwise

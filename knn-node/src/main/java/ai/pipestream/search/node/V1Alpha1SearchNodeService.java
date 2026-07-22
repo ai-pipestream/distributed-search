@@ -355,8 +355,7 @@ public class V1Alpha1SearchNodeService implements SearchService {
         java.util.concurrent.atomic.AtomicLong visitedTotal = new java.util.concurrent.atomic.AtomicLong();
 
         List<ShardSummary> shardSummaries = new ArrayList<>();
-        record ShardDocument(ai.pipestream.search.query.DocumentTopDocs.DocumentHit hit, int shardId) {}
-        List<ShardDocument> merged = new ArrayList<>();
+        List<DocumentMerger.ShardDocument> perShard = new ArrayList<>();
         int failedShards = 0;
         List<String> shardErrors = new ArrayList<>();
 
@@ -392,7 +391,8 @@ public class V1Alpha1SearchNodeService implements SearchService {
                         hybridExecutor.executeDocumentCentric(query, searcher, parentsFilter,
                                 chunksPerHit, manager);
                 for (ai.pipestream.search.query.DocumentTopDocs.DocumentHit hit : topDocs.hits()) {
-                    merged.add(new ShardDocument(hit, shardId));
+                    perShard.add(new DocumentMerger.ShardDocument(
+                            hit.docId(), shardId, hit.score(), hit.chunks()));
                 }
                 shardSummaries.add(ShardSummary.newBuilder()
                         .setShardId(shardId)
@@ -429,38 +429,36 @@ public class V1Alpha1SearchNodeService implements SearchService {
             return;
         }
 
-        // Global ranking by parent score (max over chunks); ties break on
-        // docId so replicas agree. Single-shard placement means one entry
-        // per parent; the multi-shard merge collapses duplicates by doc id.
-        merged.sort((a, b) -> {
-            int byScore = Float.compare(b.hit().score(), a.hit().score());
-            return byScore != 0 ? byScore : a.hit().docId().compareTo(b.hit().docId());
-        });
+        // Cross-shard collapse by parent id: a balanced-placement parent
+        // returns from every shard holding one of its blocks; the merge takes
+        // the max score and concatenates the (disjoint) chunk lists.
+        List<DocumentMerger.MergedDocument> merged =
+                DocumentMerger.merge(perShard, targetSize, chunksPerHit);
 
         int emitted = 0;
         float kthBestFloor = Float.NEGATIVE_INFINITY;
         List<String> topDocIds = new ArrayList<>();
-        for (ShardDocument entry : merged) {
-            if (emitted >= targetSize || emitter.isCancelled()) {
+        for (DocumentMerger.MergedDocument document : merged) {
+            if (emitter.isCancelled()) {
                 break;
             }
             emitted++;
-            ai.pipestream.search.query.DocumentTopDocs.DocumentHit docHit = entry.hit();
-            topDocIds.add(docHit.docId());
-            kthBestFloor = Math.max(kthBestFloor, docHit.score());
+            topDocIds.add(document.docId());
+            kthBestFloor = Math.max(kthBestFloor, document.score());
 
             Hit.Builder hitBuilder = Hit.newBuilder()
-                    .setDocId(docHit.docId())
-                    .setScore(docHit.score())
-                    .setShardId(entry.shardId())
+                    .setDocId(document.docId())
+                    .setScore(document.score())
+                    .setShardId(document.shardId())
                     .setResultPosition(emitted);
-            for (ai.pipestream.search.query.DocumentTopDocs.ChunkScore chunk : docHit.chunks()) {
+            for (DocumentMerger.ShardChunk shardChunk : document.chunks()) {
+                ai.pipestream.search.query.DocumentTopDocs.ChunkScore chunk = shardChunk.chunk();
                 hitBuilder.addChunks(ChunkHit.newBuilder()
                         .setChunkId(chunk.chunkId())
                         .setScore(chunk.score())
                         .setText(chunk.text())
                         .setOrdinal(chunk.ordinal())
-                        .setShardId(entry.shardId())
+                        .setShardId(shardChunk.shardId())
                         .setStartOffset(chunk.startOffset())
                         .setEndOffset(chunk.endOffset())
                         .build());

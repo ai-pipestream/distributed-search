@@ -77,6 +77,16 @@ public class BlockWriter {
         return matched;
     }
 
+    /**
+     * Compensation for a partially-failed multi-shard parent write: removes
+     * this parent's members at {@code generation} and above on one shard.
+     */
+    public void deleteGeneration(String collection, int shardId, String docId,
+                                 long generation) throws IOException {
+        IndexWriter writer = collectionManager.getWriter(collection, shardId);
+        writer.deleteDocuments(BlockJoinFields.generationQuery(docId, generation));
+    }
+
     /** Highest generation this shard holds for the parent; 0 when absent. */
     public long lastGeneration(String collection, int shardId, String docId) throws IOException {
         DirectoryReader reader;
