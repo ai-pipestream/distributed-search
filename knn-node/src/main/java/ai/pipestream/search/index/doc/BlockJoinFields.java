@@ -43,6 +43,8 @@ public final class BlockJoinFields {
     public static final String CHUNK_TEXT = "_chunk_text";
     /** Raw Chunk.payload Any bytes, stored on children for retrieval. */
     public static final String CHUNK_PAYLOAD = "_chunk_payload";
+    /** Serialized NlpSpans for the chunk (mode A, nlp_layers), stored on children. */
+    public static final String CHUNK_NLP = "_chunk_nlp";
     /** Raw parent payload Any bytes, stored on the stub for retrieval. */
     public static final String PARENT_PAYLOAD = "_payload";
 

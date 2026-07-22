@@ -185,13 +185,18 @@ public class HybridExecutor {
                     Number start = numeric(childDoc, BlockJoinFields.CHUNK_START);
                     Number end = numeric(childDoc, BlockJoinFields.CHUNK_END);
                     String text = childDoc.get(BlockJoinFields.CHUNK_TEXT);
+                    org.apache.lucene.util.BytesRef nlp =
+                            childDoc.getBinaryValue(BlockJoinFields.CHUNK_NLP);
                     chunks.add(new DocumentTopDocs.ChunkScore(
                             chunkId == null ? "" : chunkId,
                             ordinal == null ? 0 : ordinal.intValue(),
                             start == null ? 0 : start.intValue(),
                             end == null ? 0 : end.intValue(),
                             score,
-                            text == null ? "" : text));
+                            text == null ? "" : text,
+                            nlp == null ? null
+                                    : java.util.Arrays.copyOfRange(nlp.bytes, nlp.offset,
+                                            nlp.offset + nlp.length)));
                     child = iterator.nextDoc();
                 }
             }

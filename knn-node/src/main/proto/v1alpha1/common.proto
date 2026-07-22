@@ -336,6 +336,28 @@ message ChunkHit {
   int32 shard_id = 5;
   int32 start_offset = 6;
   int32 end_offset = 7;
+  // NLP annotations persisted at index time (ChunkAndEmbed.nlp_layers).
+  // Offsets are in the PARENT's chunk-source text, the same space as
+  // start_offset/end_offset, so they highlight the original directly.
+  repeated NlpSpan nlp = 8;
+}
+
+// One NLP annotation over the parent's chunk-source text. Offsets always
+// refer to the ORIGINAL text (never a normalized form), so annotations can
+// be mapped back through upstream offset contracts (e.g. parse provenance).
+message NlpSpan {
+  // Layer name, e.g. "tokens", "sentences", "entities".
+  string layer = 1;
+  int32 start = 2;
+  int32 end = 3;
+  // Layer value (e.g. an entity type); the covered text is reconstructible
+  // from the offsets against the parent text.
+  string value = 4;
+}
+
+// Storage container for chunk-attached annotations.
+message NlpSpans {
+  repeated NlpSpan spans = 1;
 }
 
 // Periodic execution telemetry. Frequency is server-chosen unless
@@ -563,6 +585,10 @@ message Chunk {
   // in mode A; optional and echoed in mode B.
   int32 start_offset = 6;
   int32 end_offset = 7;
+  // NLP annotations for this chunk's span, offsets in the parent text.
+  // Server-filled in mode A when the derive config requests nlp_layers;
+  // stored on the child document and returned by GetDocument.
+  repeated NlpSpan nlp = 8;
 }
 
 // Placement and replacement policy for a parent document.

@@ -16,5 +16,12 @@ public record DocumentTopDocs(List<DocumentHit> hits) {
 
     /** One exactly-scored chunk of a returned document. */
     public record ChunkScore(String chunkId, int ordinal, int startOffset, int endOffset,
-                             float score, String text) {}
+                             float score, String text, byte[] nlp) {
+
+        /** Chunk without stored NLP annotations. */
+        public ChunkScore(String chunkId, int ordinal, int startOffset, int endOffset,
+                          float score, String text) {
+            this(chunkId, ordinal, startOffset, endOffset, score, text, null);
+        }
+    }
 }

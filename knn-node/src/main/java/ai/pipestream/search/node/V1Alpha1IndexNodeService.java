@@ -604,6 +604,16 @@ public class V1Alpha1IndexNodeService implements IndexService {
                                 + pieces.size() + " chunks"));
             }
 
+            // NLP layers: annotate the WHOLE parent text once, then attach to
+            // each chunk the spans overlapping it. Offsets stay in the parent
+            // text so hits highlight the original directly.
+            List<ai.pipestream.search.nlp.NlpPipeline.NlpSpan> allSpans = List.of();
+            if (spec.config().getNlpLayersCount() > 0) {
+                allSpans = ai.pipestream.search.nlp.NlpPipeline
+                        .forLayers(spec.config().getNlpLayersList(), chunkSpec.boundary())
+                        .annotate(text);
+            }
+
             SuppliedChunks.Builder chunks = SuppliedChunks.newBuilder();
             Map<Integer, String> chunkTexts = new java.util.HashMap<>();
             int[] modeAOrdinals = new int[pieces.size()];
@@ -616,13 +626,22 @@ public class V1Alpha1IndexNodeService implements IndexService {
                 for (float f : vector) {
                     vectorProto.addValues(f);
                 }
-                chunks.addChunks(Chunk.newBuilder()
+                Chunk.Builder chunk = Chunk.newBuilder()
                         .setOrdinal(i)
                         .setStartOffset(pieces.get(i).startOffset())
                         .setEndOffset(pieces.get(i).endOffset())
                         .setVector(vectorProto)
-                        .setVectorField(spec.vectorField())
-                        .build());
+                        .setVectorField(spec.vectorField());
+                for (ai.pipestream.search.nlp.NlpPipeline.NlpSpan span
+                        : ai.pipestream.search.nlp.NlpPipeline.overlapping(
+                                allSpans, pieces.get(i).startOffset(), pieces.get(i).endOffset())) {
+                    chunk.addNlp(ai.pipestream.search.v1alpha1.NlpSpan.newBuilder()
+                            .setLayer(span.layer())
+                            .setStart(span.start())
+                            .setEnd(span.end())
+                            .setValue(span.value()));
+                }
+                chunks.addChunks(chunk.build());
                 modeAOrdinals[i] = i;
                 if (spec.config().getStoreChunkText()) {
                     chunkTexts.put(i, pieces.get(i).text());
@@ -1242,6 +1261,13 @@ public class V1Alpha1IndexNodeService implements IndexService {
                 chunk.setPayload(com.google.protobuf.Any.parseFrom(
                         com.google.protobuf.ByteString.copyFrom(
                                 payload.bytes, payload.offset, payload.length)));
+            }
+            org.apache.lucene.util.BytesRef nlp =
+                    child.getBinaryValue(BlockJoinFields.CHUNK_NLP);
+            if (nlp != null) {
+                chunk.addAllNlp(ai.pipestream.search.v1alpha1.NlpSpans.parseFrom(
+                        com.google.protobuf.ByteString.copyFrom(
+                                nlp.bytes, nlp.offset, nlp.length)).getSpansList());
             }
             into.add(chunk.build());
         }

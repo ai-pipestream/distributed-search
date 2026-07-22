@@ -69,7 +69,7 @@ public class V1Alpha1ModeAIngestTest {
                 .setOptions(searchField(options)));
     }
 
-    private static FileDescriptorProto schemaFile(int declaredDims) {
+    private static FileDescriptorProto schemaFile(int declaredDims, String... nlpLayers) {
         SearchField body = SearchField.newBuilder()
                 .setType(FieldType.FIELD_TYPE_TEXT).setStored(true)
                 .addRepresentations(Representation.newBuilder()
@@ -81,6 +81,7 @@ public class V1Alpha1ModeAIngestTest {
                         .setDerive(ChunkAndEmbed.newBuilder()
                                 .setModel(TestEmbeddingProvider.MODEL)
                                 .setStoreChunkText(true)
+                                .addAllNlpLayers(java.util.List.of(nlpLayers))
                                 .setSpec(ChunkSpec.newBuilder()
                                         .setTargetTokens(10)
                                         .setOverlapTokens(1)
@@ -108,9 +109,9 @@ public class V1Alpha1ModeAIngestTest {
                 .build();
     }
 
-    private static FileDescriptorSet wireSet(int declaredDims) throws Exception {
+    private static FileDescriptorSet wireSet(int declaredDims, String... nlpLayers) throws Exception {
         byte[] bytes = FileDescriptorSet.newBuilder()
-                .addFile(schemaFile(declaredDims)).build().toByteArray();
+                .addFile(schemaFile(declaredDims, nlpLayers)).build().toByteArray();
         return FileDescriptorSet.parseFrom(bytes);
     }
 
@@ -261,6 +262,125 @@ public class V1Alpha1ModeAIngestTest {
         Assertions.assertEquals(0, replayAck.getStatus().getCode());
         Assertions.assertEquals(4, replayAck.getChunkCount(),
                 "the same text must chunk identically, forever");
+
+        adminService.dropCollection(DropCollectionRequest.newBuilder()
+                .setName(collection).build()).await().indefinitely();
+    }
+
+    @Test
+    public void nlpLayersArePersistedAndReturnedOnHits() throws Exception {
+        String collection = "modea-nlp";
+        adminService.createCollection(CreateCollectionRequest.newBuilder()
+                .setName(collection).setNumShards(1).build()).await().indefinitely();
+        adminService.registerSchema(RegisterSchemaRequest.newBuilder()
+                .setCollection(collection)
+                .setSource(SchemaSource.newBuilder()
+                        .setDescriptorSet(wireSet(4, "tokens"))
+                        .setRootMessage("t.Doc")
+                        .setChunkMessage("t.DocChunk"))
+                .build()).await().indefinitely();
+
+        List<BulkIndexResponse> responses = indexService.bulkIndex(Multi.createFrom().item(
+                BulkIndexRequest.newBuilder().setParentDocument(IndexParentDocument.newBuilder()
+                        .setClientSeq(1)
+                        .setCollection(collection)
+                        .setDocId("annotated")
+                        .setPayload(payload("annotated doc", BODY))
+                        .setServerChunking(ServerChunking.getDefaultInstance())
+                        .build()).build()
+        )).collect().asList().await().indefinitely();
+        ParentAck ack = responses.stream()
+                .filter(r -> r.getFrameCase() == BulkIndexResponse.FrameCase.PARENT_ACK)
+                .findFirst().orElseThrow().getParentAck();
+        Assertions.assertEquals(0, ack.getStatus().getCode(),
+                "nlp-annotated mode A must succeed: " + ack.getStatus().getMessage());
+
+        // GetDocument: every chunk carries token spans in PARENT-text offsets.
+        GetDocumentResponse got = indexService.getDocument(GetDocumentRequest.newBuilder()
+                .setCollection(collection).setDocId("annotated").setIncludeChunks(true)
+                .build()).await().indefinitely();
+        Assertions.assertTrue(got.getFound());
+        for (Chunk chunk : got.getChunksList()) {
+            Assertions.assertTrue(chunk.getNlpCount() > 0,
+                    "every chunk must carry its token annotations");
+            for (NlpSpan span : chunk.getNlpList()) {
+                Assertions.assertEquals("tokens", span.getLayer());
+                Assertions.assertTrue(span.getStart() < chunk.getEndOffset()
+                                && span.getEnd() > chunk.getStartOffset(),
+                        "a stored span must overlap its chunk");
+                Assertions.assertEquals(BODY.substring(span.getStart(), span.getEnd()),
+                        span.getValue(),
+                        "offsets are in the ORIGINAL parent text, never chunk-local");
+            }
+        }
+
+        // Search: the winning ChunkHit surfaces the same annotations.
+        String sentence = BODY.substring(
+                got.getChunks(1).getStartOffset(), got.getChunks(1).getEndOffset());
+        float[] queryVector = TestEmbeddingProvider.embedOne(sentence);
+        Vector.Builder queryProto = Vector.newBuilder();
+        for (float f : queryVector) {
+            queryProto.addValues(f);
+        }
+        List<SearchResponse> searchResponses = searchService.search(SearchRequest.newBuilder()
+                .setCollection(collection)
+                .setSize(5)
+                .setChunksPerHit(10)
+                .setQuery(Query.newBuilder().setKnn(KnnQuery.newBuilder()
+                        .setField("body#chunks")
+                        .setVector(queryProto)
+                        .setK(5)
+                        .setDocumentCentric(true)))
+                .build()).collect().asList().await().indefinitely();
+        Hit hit = searchResponses.stream()
+                .filter(r -> r.getFrameCase() == SearchResponse.FrameCase.HIT)
+                .map(SearchResponse::getHit)
+                .findFirst().orElseThrow();
+        ChunkHit best = hit.getChunks(0);
+        Assertions.assertTrue(best.getNlpCount() > 0,
+                "search hits must carry the persisted annotations");
+        for (NlpSpan span : best.getNlpList()) {
+            Assertions.assertEquals(BODY.substring(span.getStart(), span.getEnd()),
+                    span.getValue(), "hit annotations highlight the original text");
+        }
+
+        adminService.dropCollection(DropCollectionRequest.newBuilder()
+                .setName(collection).build()).await().indefinitely();
+    }
+
+    @Test
+    public void nlpLayerValidationFailsAtRegistration() throws Exception {
+        String collection = "modea-nlp-invalid";
+        adminService.createCollection(CreateCollectionRequest.newBuilder()
+                .setName(collection).setNumShards(1).build()).await().indefinitely();
+
+        io.grpc.StatusRuntimeException unsupported = Assertions.assertThrows(
+                io.grpc.StatusRuntimeException.class,
+                () -> adminService.registerSchema(RegisterSchemaRequest.newBuilder()
+                        .setCollection(collection)
+                        .setSource(SchemaSource.newBuilder()
+                                .setDescriptorSet(wireSet(4, "coref"))
+                                .setRootMessage("t.Doc")
+                                .setChunkMessage("t.DocChunk"))
+                        .build()).await().indefinitely());
+        Assertions.assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT,
+                unsupported.getStatus().getCode());
+        Assertions.assertTrue(unsupported.getStatus().getDescription().contains("coref"));
+
+        io.grpc.StatusRuntimeException unpinned = Assertions.assertThrows(
+                io.grpc.StatusRuntimeException.class,
+                () -> adminService.registerSchema(RegisterSchemaRequest.newBuilder()
+                        .setCollection(collection)
+                        .setSource(SchemaSource.newBuilder()
+                                .setDescriptorSet(wireSet(4, "sentences"))
+                                .setRootMessage("t.Doc")
+                                .setChunkMessage("t.DocChunk"))
+                        .build()).await().indefinitely());
+        Assertions.assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT,
+                unpinned.getStatus().getCode());
+        Assertions.assertTrue(unpinned.getStatus().getDescription().contains("boundary pin"),
+                "the sentences layer without an opennlp pin must name the missing pin: "
+                        + unpinned.getStatus().getDescription());
 
         adminService.dropCollection(DropCollectionRequest.newBuilder()
                 .setName(collection).build()).await().indefinitely();

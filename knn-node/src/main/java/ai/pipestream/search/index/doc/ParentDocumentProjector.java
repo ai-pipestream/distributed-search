@@ -133,6 +133,12 @@ public class ParentDocumentProjector {
             doc.add(new StoredField(BlockJoinFields.CHUNK_PAYLOAD, chunk.getPayload().toByteArray()));
         }
 
+        if (chunk.getNlpCount() > 0) {
+            doc.add(new StoredField(BlockJoinFields.CHUNK_NLP,
+                    ai.pipestream.search.v1alpha1.NlpSpans.newBuilder()
+                            .addAllSpans(chunk.getNlpList()).build().toByteArray()));
+        }
+
         if (!chunk.hasVector()) {
             throw new InvalidPayloadException("Chunk '" + chunkId + "' has no vector");
         }

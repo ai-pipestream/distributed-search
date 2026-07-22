@@ -239,6 +239,24 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
                         throw io.grpc.Status.INVALID_ARGUMENT
                                 .withDescription(e.getMessage()).asRuntimeException();
                     }
+                    for (String layer : derive.config().getNlpLayersList()) {
+                        if (!ai.pipestream.search.nlp.NlpPipeline.SUPPORTED_LAYERS.contains(layer)) {
+                            throw io.grpc.Status.INVALID_ARGUMENT
+                                    .withDescription("Derivation on '" + derive.vectorField()
+                                            + "': unsupported nlp layer '" + layer + "'; supported: "
+                                            + ai.pipestream.search.nlp.NlpPipeline.SUPPORTED_LAYERS)
+                                    .asRuntimeException();
+                        }
+                        if (ai.pipestream.search.nlp.NlpPipeline.LAYER_SENTENCES.equals(layer)
+                                && !derive.config().getSpec().getBoundary()
+                                        .startsWith(ai.pipestream.search.nlp.OpenNlpModels.BOUNDARY_PREFIX)) {
+                            throw io.grpc.Status.INVALID_ARGUMENT
+                                    .withDescription("Derivation on '" + derive.vectorField()
+                                            + "': nlp layer 'sentences' requires an opennlp:<sha256> "
+                                            + "boundary pin in spec.boundary")
+                                    .asRuntimeException();
+                        }
+                    }
                 }
 
                 if (!chunkMessage.isEmpty() && !config.documentCentric()) {

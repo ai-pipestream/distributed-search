@@ -453,15 +453,24 @@ public class V1Alpha1SearchNodeService implements SearchService {
                     .setResultPosition(emitted);
             for (DocumentMerger.ShardChunk shardChunk : document.chunks()) {
                 ai.pipestream.search.query.DocumentTopDocs.ChunkScore chunk = shardChunk.chunk();
-                hitBuilder.addChunks(ChunkHit.newBuilder()
+                ChunkHit.Builder chunkHit = ChunkHit.newBuilder()
                         .setChunkId(chunk.chunkId())
                         .setScore(chunk.score())
                         .setText(chunk.text())
                         .setOrdinal(chunk.ordinal())
                         .setShardId(shardChunk.shardId())
                         .setStartOffset(chunk.startOffset())
-                        .setEndOffset(chunk.endOffset())
-                        .build());
+                        .setEndOffset(chunk.endOffset());
+                if (chunk.nlp() != null) {
+                    try {
+                        chunkHit.addAllNlp(ai.pipestream.search.v1alpha1.NlpSpans
+                                .parseFrom(chunk.nlp()).getSpansList());
+                    } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+                        LOG.warnf("Dropping unreadable stored NLP spans for chunk %s: %s",
+                                chunk.chunkId(), e.getMessage());
+                    }
+                }
+                hitBuilder.addChunks(chunkHit.build());
             }
             emitter.emit(SearchResponse.newBuilder().setHit(hitBuilder.build()).build());
         }

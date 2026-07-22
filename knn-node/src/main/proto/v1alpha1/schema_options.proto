@@ -192,6 +192,12 @@ message ChunkAndEmbed {
   // always carry char offsets, so text is reconstructible from the parent
   // store without duplicating the corpus into every vector shard.
   bool store_chunk_text = 6;
+  // NLP layers to annotate at index time and persist per chunk (returned on
+  // ChunkHit.nlp and GetDocument chunks). Supported today: "tokens"
+  // (model-free), "sentences" (requires an opennlp:<sha256> boundary pin in
+  // spec.boundary). Annotations are a pure function of (text, layer, pinned
+  // models) and participate in the plan digest via this config.
+  repeated string nlp_layers = 7;
 }
 
 // How the server chunks a mode-A parent. MUST be a pure function of
