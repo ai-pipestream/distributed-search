@@ -73,6 +73,9 @@ dependencies {
         implementation "ai.pipestream:lucene-sandbox:${luceneForkVersion}"
         implementation "ai.pipestream:lucene-analysis-common:${luceneForkVersion}"
         implementation "ai.pipestream:lucene-queryparser:${luceneForkVersion}"
+        // Block-join document-centric kNN: DiversifyingChildren* queries plus the
+        // fork's SharedFloorDiversifyingKnnCollectorManager composition.
+        implementation "ai.pipestream:lucene-join:${luceneForkVersion}"
     }
     // Rerank SPI for the coordinator rerank head. The sibling plain-Java
     // embeddings build is wired as a composite (see settings.gradle); the

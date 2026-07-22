@@ -510,6 +510,20 @@ message FieldSchema {
   bool stored = 15;
 }
 
+// Immutable schema identity. Collections pin one; writers assert one.
+// The server NEVER resolves "latest" for a write.
+message SchemaPin {
+  // Registry coordinate, opaque to the engine. Informational.
+  string coordinate = 1;
+  // SHA-256 over the FileDescriptorSet bytes exactly as received. THIS is
+  // the equality test: a coordinate may be re-pointed, a digest may not.
+  bytes descriptor_digest = 2;
+  // SHA-256 over the canonicalized indexing plan (and, for document-centric
+  // collections, the effective ChunkSpec). Answers "does this change require
+  // a reindex", which no descriptor hash can.
+  bytes plan_digest = 3;
+}
+
 // The full field schema of a collection. Set at collection creation; no
 // dynamic mapping. Evolves only through CollectionAdminService.
 // RegisterSchema, which applies wire-safe changes exclusively.

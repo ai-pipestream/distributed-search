@@ -32,6 +32,9 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
     @Inject
     CollectionManager collectionManager;
 
+    @Inject
+    ai.pipestream.search.schema.SchemaStore schemaStore;
+
     private final Map<String, CollectionSchema> registeredSchemas = new ConcurrentHashMap<>();
     private final Map<String, Experiment> experiments = new ConcurrentHashMap<>();
     private final Map<String, RankingProfile> rankingProfiles = new ConcurrentHashMap<>();
@@ -98,6 +101,7 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
                         .asRuntimeException();
             }
             registeredSchemas.remove(request.getName());
+            schemaStore.delete(request.getName());
             return DropCollectionResponse.newBuilder().build();
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
@@ -188,6 +192,34 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
                                     + "(ai.pipestream.search.v1alpha1.field) annotations")
                             .asRuntimeException();
                 }
+
+                String chunkMessage = request.getSource().getChunkMessage();
+                if (!chunkMessage.isEmpty() && !config.documentCentric()) {
+                    // A non-empty chunk_message declares a document-centric
+                    // collection. The parent field is create-time-only in
+                    // Lucene, so the flip is legal only while the collection
+                    // is still empty.
+                    try {
+                        config = collectionManager.replaceConfig(new CollectionConfig(
+                                config.name(), config.vectorDimension(), config.similarity(),
+                                config.numShards(), config.embeddingModel(),
+                                true, chunkMessage,
+                                CollectionConfig.PlacementMode.BALANCED_SIMILARITY,
+                                config.maxChunksPerDocument()));
+                    } catch (IllegalStateException e) {
+                        throw io.grpc.Status.FAILED_PRECONDITION
+                                .withDescription(e.getMessage())
+                                .asRuntimeException();
+                    }
+                }
+
+                // Persist the descriptor set bytes exactly as received — the
+                // digest is only stable over the original bytes.
+                schemaStore.register(request.getCollection(),
+                        request.getSource().getDescriptorSet().toByteArray(),
+                        request.getSource().getRootMessage(),
+                        chunkMessage);
+
                 CollectionSchema protoSchema = compiled.toProto();
                 registeredSchemas.put(request.getCollection(), protoSchema);
 
@@ -352,6 +384,11 @@ public class V1Alpha1AdminNodeService implements CollectionAdminService {
                                     .build())
                             .build())
                     .build());
+        }
+
+        schemaStore.get(config.name()).ifPresent(stored -> builder.setSchemaPin(stored.toPin()));
+        if (config.documentCentric()) {
+            builder.setChunkMessage(config.chunkMessage());
         }
 
         for (int i = 0; i < config.numShards(); i++) {

@@ -35,6 +35,9 @@ public class CollectionManager {
     private static final Logger LOG = Logger.getLogger(CollectionManager.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /** Doc-values field carrying the block-join parent marker (setParentField). */
+    public static final String PARENT_FIELD = "_parent";
+
     @ConfigProperty(name = "knn.data.dir", defaultValue = "data")
     String dataDir;
 
@@ -74,35 +77,77 @@ public class CollectionManager {
     public CollectionConfig createCollection(String name, int vectorDimension,
                                              VectorSimilarityFunction similarity,
                                              int numShards, String embeddingModel) throws IOException {
+        return createCollection(new CollectionConfig(name, vectorDimension, similarity, numShards, embeddingModel));
+    }
+
+    public synchronized CollectionConfig createCollection(CollectionConfig config) throws IOException {
+        String name = config.name();
         CollectionConfig existing = configs.get(name);
         if (existing != null) {
-            if (existing.vectorDimension() == vectorDimension && existing.numShards() == numShards) {
+            if (existing.vectorDimension() == config.vectorDimension()
+                    && existing.numShards() == config.numShards()
+                    && existing.documentCentric() == config.documentCentric()) {
                 LOG.infof("Collection '%s' already exists with matching config — returning existing", name);
                 return existing;
             }
             throw new IllegalArgumentException(
                     "Collection already exists with different config: " + name
                             + " (existing dim=" + existing.vectorDimension() + "/shards=" + existing.numShards()
-                            + ", requested dim=" + vectorDimension + "/shards=" + numShards + ")");
+                            + "/documentCentric=" + existing.documentCentric()
+                            + ", requested dim=" + config.vectorDimension() + "/shards=" + config.numShards()
+                            + "/documentCentric=" + config.documentCentric() + ")");
         }
 
-        CollectionConfig config = new CollectionConfig(name, vectorDimension, similarity, numShards, embeddingModel);
         Path collectionDir = collectionDir(name);
         Files.createDirectories(collectionDir);
 
-        for (int i = 0; i < numShards; i++) {
+        for (int i = 0; i < config.numShards(); i++) {
             Files.createDirectories(shardDir(name, i));
         }
 
         writeConfig(collectionDir.resolve("collection.json"), config);
         configs.put(name, config);
 
-        LOG.infof("Created collection: %s (dim=%d, similarity=%s, shards=%d)", name, vectorDimension, similarity, numShards);
+        LOG.infof("Created collection: %s (dim=%d, similarity=%s, shards=%d, documentCentric=%s)",
+                name, config.vectorDimension(), config.similarity(), config.numShards(),
+                config.documentCentric());
         return config;
     }
 
     public CollectionConfig getConfig(String name) {
         return configs.get(name);
+    }
+
+    /**
+     * Replaces a collection's config in place. Flipping {@code documentCentric}
+     * is only allowed while the collection is empty — Lucene refuses to add a
+     * parent field to an existing index with fields — and closes any open
+     * writers/readers so the next open picks up the new IndexWriterConfig.
+     */
+    public synchronized CollectionConfig replaceConfig(CollectionConfig newConfig) throws IOException {
+        CollectionConfig existing = configs.get(newConfig.name());
+        if (existing == null) {
+            throw new IllegalArgumentException("Collection not found: " + newConfig.name());
+        }
+        if (existing.numShards() != newConfig.numShards()
+                || existing.vectorDimension() != newConfig.vectorDimension()) {
+            throw new IllegalArgumentException(
+                    "numShards and vectorDimension are immutable for " + newConfig.name());
+        }
+        if (existing.documentCentric() != newConfig.documentCentric()) {
+            if (getTotalDocCount(newConfig.name()) > 0) {
+                throw new IllegalStateException(
+                        "Cannot change document-centric mode of a non-empty collection: "
+                                + newConfig.name());
+            }
+            for (int i = 0; i < existing.numShards(); i++) {
+                closeWriter(writerKey(newConfig.name(), i));
+                closeReader(writerKey(newConfig.name(), i));
+            }
+        }
+        writeConfig(collectionDir(newConfig.name()).resolve("collection.json"), newConfig);
+        configs.put(newConfig.name(), newConfig);
+        return newConfig;
     }
 
     public Collection<CollectionConfig> listCollections() {
@@ -153,6 +198,13 @@ public class CollectionManager {
         Files.createDirectories(dir);
         FSDirectory fsDir = FSDirectory.open(dir);
         IndexWriterConfig iwc = new IndexWriterConfig();
+        CollectionConfig config = configs.get(collection);
+        if (config != null && config.documentCentric()) {
+            // Block-join parent marker. Create-time only: Lucene refuses to add
+            // a parent field to an index whose segments were written without it,
+            // which is why documentCentric is immutable on CollectionConfig.
+            iwc.setParentField(PARENT_FIELD);
+        }
         IndexWriter writer = new IndexWriter(fsDir, iwc);
         writers.put(key, writer);
         return writer;
@@ -358,11 +410,18 @@ public class CollectionManager {
     }
 
     private void writeConfig(Path path, CollectionConfig config) throws IOException {
-        MAPPER.writeValue(path.toFile(), new CollectionConfigJson(
+        // Temp-file-and-rename so a crash mid-write never leaves a truncated
+        // config that poisons the next startup scan.
+        Path tmp = path.resolveSibling(path.getFileName() + ".tmp");
+        MAPPER.writeValue(tmp.toFile(), new CollectionConfigJson(
                 config.name(), config.vectorDimension(),
                 config.similarity().name(), config.numShards(),
-                config.embeddingModel()
+                config.embeddingModel(),
+                config.documentCentric(), config.chunkMessage(),
+                config.placement().name(), config.maxChunksPerDocument()
         ));
+        Files.move(tmp, path, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
     }
 
     private CollectionConfig readConfig(Path path) throws IOException {
@@ -370,7 +429,13 @@ public class CollectionManager {
         return new CollectionConfig(
                 json.name, json.vectorDimension,
                 VectorSimilarityFunction.valueOf(json.similarity),
-                json.numShards, json.embeddingModel
+                json.numShards, json.embeddingModel,
+                json.documentCentric,
+                json.chunkMessage == null ? "" : json.chunkMessage,
+                json.placement == null
+                        ? null
+                        : CollectionConfig.PlacementMode.valueOf(json.placement),
+                json.maxChunksPerDocument
         );
     }
 
@@ -380,16 +445,27 @@ public class CollectionManager {
         public String similarity;
         public int numShards;
         public String embeddingModel;
+        // Absent in pre-document-centric configs; Jackson leaves the defaults.
+        public boolean documentCentric;
+        public String chunkMessage;
+        public String placement;
+        public int maxChunksPerDocument;
 
         public CollectionConfigJson() {}
 
         public CollectionConfigJson(String name, int vectorDimension, String similarity,
-                                    int numShards, String embeddingModel) {
+                                    int numShards, String embeddingModel,
+                                    boolean documentCentric, String chunkMessage,
+                                    String placement, int maxChunksPerDocument) {
             this.name = name;
             this.vectorDimension = vectorDimension;
             this.similarity = similarity;
             this.numShards = numShards;
             this.embeddingModel = embeddingModel;
+            this.documentCentric = documentCentric;
+            this.chunkMessage = chunkMessage;
+            this.placement = placement;
+            this.maxChunksPerDocument = maxChunksPerDocument;
         }
     }
 
