@@ -39,6 +39,7 @@ dependencies {
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-smallrye-health'
     implementation 'io.quarkus:quarkus-scheduler'
+    implementation 'io.quarkus:quarkus-micrometer'
     // The shared-floor API lives on the companion Lucene branch, so these artifacts cannot
     // come from Maven Central releases yet. Default: resolve the ai.pipestream fork snapshots
     // as module dependencies from the repositories above, so a fresh clone builds with no

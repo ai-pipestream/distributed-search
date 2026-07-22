@@ -1,6 +1,5 @@
 package ai.pipestream.search.index;
 
-import ai.pipestream.index.v1.VectorSimilarity;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.scheduler.Scheduled;
@@ -19,19 +18,12 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collection;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
 /**
  * Manages collection lifecycle: creation, deletion, shard IndexWriters, and NRT readers.
- * <p>
- * On-disk layout:
- * <pre>
- *   {data_dir}/collections/{name}/collection.json   — CollectionConfig as JSON
- *   {data_dir}/collections/{name}/shard-{i}/         — Lucene index per shard
- * </pre>
  */
 @ApplicationScoped
 public class CollectionManager {
@@ -75,15 +67,11 @@ public class CollectionManager {
         }
     }
 
-    /**
-     * Create a new collection. Persists config to disk and creates shard directories.
-     */
     public CollectionConfig createCollection(String name, int vectorDimension,
                                              VectorSimilarityFunction similarity,
                                              int numShards, String embeddingModel) throws IOException {
         CollectionConfig existing = configs.get(name);
         if (existing != null) {
-            // Idempotent: same config → return existing; different config → error
             if (existing.vectorDimension() == vectorDimension && existing.numShards() == numShards) {
                 LOG.infof("Collection '%s' already exists with matching config — returning existing", name);
                 return existing;
@@ -95,8 +83,6 @@ public class CollectionManager {
         }
 
         CollectionConfig config = new CollectionConfig(name, vectorDimension, similarity, numShards, embeddingModel);
-
-        // Create directory structure
         Path collectionDir = collectionDir(name);
         Files.createDirectories(collectionDir);
 
@@ -104,7 +90,6 @@ public class CollectionManager {
             Files.createDirectories(shardDir(name, i));
         }
 
-        // Persist config
         writeConfig(collectionDir.resolve("collection.json"), config);
         configs.put(name, config);
 
@@ -112,41 +97,30 @@ public class CollectionManager {
         return config;
     }
 
-    /**
-     * Get collection config by name.
-     */
     public CollectionConfig getConfig(String name) {
         return configs.get(name);
     }
 
-    /**
-     * List all known collections.
-     */
     public Collection<CollectionConfig> listCollections() {
         return configs.values();
     }
 
-    /**
-     * Delete a collection — closes writers/readers and removes from disk.
-     */
     public boolean deleteCollection(String name) throws IOException {
         CollectionConfig config = configs.remove(name);
         if (config == null) {
             return false;
         }
 
-        // Close all writers and readers for this collection
         for (int i = 0; i < config.numShards(); i++) {
             String key = writerKey(name, i);
             closeWriter(key);
             closeReader(key);
         }
 
-        // Delete directory tree
         Path collectionDir = collectionDir(name);
         if (Files.exists(collectionDir)) {
             try (Stream<Path> walk = Files.walk(collectionDir)) {
-                walk.sorted((a, b) -> b.compareTo(a)) // reverse order: files before dirs
+                walk.sorted((a, b) -> b.compareTo(a))
                         .forEach(p -> {
                             try {
                                 Files.deleteIfExists(p);
@@ -161,9 +135,6 @@ public class CollectionManager {
         return true;
     }
 
-    /**
-     * Get or create an IndexWriter for the given collection shard.
-     */
     public IndexWriter getWriter(String collection, int shardId) throws IOException {
         String key = writerKey(collection, shardId);
         IndexWriter existing = writers.get(key);
@@ -171,7 +142,6 @@ public class CollectionManager {
             return existing;
         }
 
-        // Double-checked locking with computeIfAbsent
         return writers.compute(key, (k, w) -> {
             if (w != null && w.isOpen()) return w;
             try {
@@ -186,21 +156,14 @@ public class CollectionManager {
         });
     }
 
-    /**
-     * Get a NRT DirectoryReader for the given collection shard.
-     * Opens from IndexWriter if available (NRT), otherwise opens directly from directory.
-     */
     public synchronized DirectoryReader getReader(String collection, int shardId) throws IOException {
         String key = writerKey(collection, shardId);
 
         DirectoryReader currentReader = readers.get(key);
         if (currentReader != null) {
-            // Try to refresh for NRT
             DirectoryReader newReader = DirectoryReader.openIfChanged(currentReader);
             if (newReader != null) {
                 readers.put(key, newReader);
-                // The cache owns one reference. Active searches acquire their own reference below,
-                // so replacing the cached reader cannot close a reader that is still in use.
                 currentReader.close();
                 newReader.incRef();
                 return newReader;
@@ -209,7 +172,6 @@ public class CollectionManager {
             return currentReader;
         }
 
-        // Open new reader
         IndexWriter writer = writers.get(key);
         DirectoryReader reader;
         if (writer != null && writer.isOpen()) {
@@ -226,21 +188,16 @@ public class CollectionManager {
         return reader;
     }
 
-    /** Release a reader previously acquired through {@link #getReader(String, int)}. */
     public void releaseReader(DirectoryReader reader) throws IOException {
         reader.decRef();
     }
 
-    /**
-     * Get document count for a specific shard.
-     */
     public long getDocCount(String collection, int shardId) {
         String key = writerKey(collection, shardId);
         IndexWriter writer = writers.get(key);
         if (writer != null && writer.isOpen()) {
             return writer.getDocStats().numDocs;
         }
-        // Fall back to reader if writer not open
         DirectoryReader reader = readers.get(key);
         if (reader != null) {
             return reader.numDocs();
@@ -248,9 +205,6 @@ public class CollectionManager {
         return 0;
     }
 
-    /**
-     * Total doc count across all shards for a collection.
-     */
     public long getTotalDocCount(String collection) {
         CollectionConfig config = configs.get(collection);
         if (config == null) return 0;
@@ -261,18 +215,28 @@ public class CollectionManager {
         return total;
     }
 
-    /**
-     * Determine which shard a document belongs to.
-     */
     public int routeToShard(String docId, int numShards) {
         return Math.floorMod(docId.hashCode(), numShards);
     }
 
-    /**
-     * Periodic commit for durability.
-     */
+    public void flush(String collection, int shardId) throws IOException {
+        String key = writerKey(collection, shardId);
+        IndexWriter writer = writers.get(key);
+        if (writer != null && writer.isOpen()) {
+            writer.flush();
+        }
+    }
+
+    public void commit(String collection, int shardId) throws IOException {
+        String key = writerKey(collection, shardId);
+        IndexWriter writer = writers.get(key);
+        if (writer != null && writer.isOpen()) {
+            writer.commit();
+        }
+    }
+
     @Scheduled(every = "5s")
-    void periodicCommit() {
+    public void periodicCommit() {
         writers.forEach((key, writer) -> {
             if (writer.isOpen() && writer.hasUncommittedChanges()) {
                 try {
@@ -288,15 +252,10 @@ public class CollectionManager {
         close();
     }
 
-    /**
-     * Close all writers and readers.
-     */
     public void close() {
         writers.forEach((key, writer) -> closeWriter(key));
         readers.forEach((key, reader) -> closeReader(key));
     }
-
-    // --- Private helpers ---
 
     private Path collectionDir(String name) {
         return Path.of(dataDir, "collections", name);
@@ -352,7 +311,6 @@ public class CollectionManager {
         );
     }
 
-    /** JSON-serializable form of CollectionConfig. */
     static class CollectionConfigJson {
         public String name;
         public int vectorDimension;
@@ -372,8 +330,17 @@ public class CollectionManager {
         }
     }
 
-    /** Convert proto VectorSimilarity to Lucene VectorSimilarityFunction. */
-    public static VectorSimilarityFunction toLuceneSimilarity(VectorSimilarity protoSimilarity) {
+    public static VectorSimilarityFunction toLuceneSimilarity(ai.pipestream.search.v1alpha1.VectorSimilarity protoSimilarity) {
+        return switch (protoSimilarity) {
+            case VECTOR_SIMILARITY_COSINE, VECTOR_SIMILARITY_UNSPECIFIED -> VectorSimilarityFunction.COSINE;
+            case VECTOR_SIMILARITY_DOT_PRODUCT -> VectorSimilarityFunction.DOT_PRODUCT;
+            case VECTOR_SIMILARITY_EUCLIDEAN -> VectorSimilarityFunction.EUCLIDEAN;
+            case VECTOR_SIMILARITY_MAX_INNER_PRODUCT -> VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT;
+            default -> VectorSimilarityFunction.COSINE;
+        };
+    }
+
+    public static VectorSimilarityFunction toLuceneSimilarity(ai.pipestream.index.v1.VectorSimilarity protoSimilarity) {
         return switch (protoSimilarity) {
             case VECTOR_SIMILARITY_COSINE, VECTOR_SIMILARITY_UNSPECIFIED -> VectorSimilarityFunction.COSINE;
             case VECTOR_SIMILARITY_DOT_PRODUCT -> VectorSimilarityFunction.DOT_PRODUCT;
