@@ -13,22 +13,26 @@ repositories {
     }
     // The ai.pipestream fork snapshots (shared-floor Lucene, preview OpenNLP) resolve from
     // Central's snapshot repository, which every runner can reach; the ai.pipestream registry
-    // stays as a fallback. Both are scoped to the forks: without the filter, every dependency
-    // would be looked up on a host some runners cannot reach, and a slow or unreachable host
-    // would fail resolution at configuration time.
+    // stays as a fallback for them. Protomolt is the opposite case: its Central snapshot
+    // publish is workflow_dispatch only (quota-constrained) and lags by weeks, so the Central
+    // copy can serve an API this repo no longer compiles against, and protomolt therefore
+    // resolves from the registry below and deliberately NOT from here. Both blocks are scoped
+    // by filter: without one, every dependency would be looked up on a host some runners
+    // cannot reach, and a slow or unreachable host would fail resolution at configuration
+    // time.
     maven {
         url = uri('https://central.sonatype.com/repository/maven-snapshots/')
         content {
-            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp|protomolt)(-.*)?')
+            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp)(-.*)?')
         }
     }
     maven {
         url = uri('https://git.rokkon.com/api/packages/ai-pipestream/maven')
         content {
-            // Deliberately NOT protomolt: this registry holds an old manual
-            // protomolt push, and any repo that can serve the module may win
-            // on a cached runner. Protomolt snapshots come from Central only.
-            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp)(-.*)?')
+            // Protomolt included deliberately: protomolt's publish-registry workflow pushes
+            // a snapshot here on every push to its main, so this registry tracks the code
+            // while Central's protomolt snapshot is weeks stale.
+            includeModuleByRegex('ai\\.pipestream', '(lucene|opennlp|protomolt)(-.*)?')
         }
     }
     mavenCentral()
