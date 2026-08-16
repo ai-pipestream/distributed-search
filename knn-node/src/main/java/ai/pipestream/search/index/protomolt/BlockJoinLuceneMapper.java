@@ -3,7 +3,7 @@ package ai.pipestream.search.index.protomolt;
 import ai.pipestream.proto.index.lucene.ProtoLuceneMapper;
 import ai.pipestream.proto.index.spi.BlockRole;
 import ai.pipestream.proto.index.spi.IndexFieldKind;
-import ai.pipestream.proto.index.spi.IndexingPlan;
+import ai.pipestream.proto.index.spi.IndexMapping;
 import ai.pipestream.proto.index.spi.SearchEngineIndexer;
 import ai.pipestream.proto.mapper.MappingException;
 import ai.pipestream.proto.mapper.ProtoFieldMapper;
@@ -73,10 +73,10 @@ public final class BlockJoinLuceneMapper implements SearchEngineIndexer {
      * SPI entry point: identity comes from the plan's {@code doc_id}-role
      * field and the generation is fixed at 1 — SPI callers have no write
      * protocol carrying one. Engine ingest, which does, uses
-     * {@link #map(String, long, Message, IndexingPlan)}.
+     * {@link #map(String, long, Message, IndexMapping)}.
      */
     @Override
-    public List<Document> map(Message message, IndexingPlan plan) throws MappingException {
+    public List<Document> map(Message message, IndexMapping plan) throws MappingException {
         Objects.requireNonNull(plan, "plan");
         Split split = split(plan);
         if (split.docIdField == null) {
@@ -93,7 +93,7 @@ public final class BlockJoinLuceneMapper implements SearchEngineIndexer {
     }
 
     /** Engine entry point: identity and generation come from the write protocol. */
-    public List<Document> map(String docId, long generation, Message message, IndexingPlan plan)
+    public List<Document> map(String docId, long generation, Message message, IndexMapping plan)
             throws MappingException {
         Objects.requireNonNull(message, "message");
         Split split = split(Objects.requireNonNull(plan, "plan"));
@@ -134,23 +134,23 @@ public final class BlockJoinLuceneMapper implements SearchEngineIndexer {
     }
 
     /** Plan split into chunk scope, stub scope, and the role-tagged fields. */
-    private record Split(IndexingPlan.IndexedField chunkField,
-                         IndexingPlan.IndexedField docIdField,
-                         IndexingPlan.IndexedField chunkIdField,
-                         IndexingPlan childPlan,
-                         IndexingPlan parentPlan) {
+    private record Split(IndexMapping.IndexedField chunkField,
+                         IndexMapping.IndexedField docIdField,
+                         IndexMapping.IndexedField chunkIdField,
+                         IndexMapping childPlan,
+                         IndexMapping parentPlan) {
     }
 
-    private static Split split(IndexingPlan plan) throws MappingException {
-        IndexingPlan.IndexedField chunkField = resolveChunkField(plan);
+    private static Split split(IndexMapping plan) throws MappingException {
+        IndexMapping.IndexedField chunkField = resolveChunkField(plan);
         String chunkPrefix = chunkField.path() + ".";
 
-        IndexingPlan.IndexedField docIdField = null;
-        IndexingPlan.IndexedField chunkIdField = null;
-        List<IndexingPlan.IndexedField> childFields = new ArrayList<>();
-        List<IndexingPlan.IndexedField> parentFields = new ArrayList<>();
+        IndexMapping.IndexedField docIdField = null;
+        IndexMapping.IndexedField chunkIdField = null;
+        List<IndexMapping.IndexedField> childFields = new ArrayList<>();
+        List<IndexMapping.IndexedField> parentFields = new ArrayList<>();
 
-        for (IndexingPlan.IndexedField field : plan.fields()) {
+        for (IndexMapping.IndexedField field : plan.fields()) {
             if (field == chunkField) {
                 continue;
             }
@@ -158,7 +158,7 @@ public final class BlockJoinLuceneMapper implements SearchEngineIndexer {
             BlockRole blockRole = field.hint().blockRole();
             String role = field.hint().engineParams(ENGINE_ID).get(ROLE_PARAM);
             if (inChunkScope) {
-                IndexingPlan.IndexedField relative = new IndexingPlan.IndexedField(
+                IndexMapping.IndexedField relative = new IndexMapping.IndexedField(
                         field.path().substring(chunkPrefix.length()),
                         field.fieldName(), field.hint(), field.repeated());
                 if (blockRole == BlockRole.CHUNK_ID || ROLE_CHUNK_ID.equals(role)) {
@@ -185,8 +185,8 @@ public final class BlockJoinLuceneMapper implements SearchEngineIndexer {
         }
 
         return new Split(chunkField, docIdField, chunkIdField,
-                new IndexingPlan(plan.messageFullName() + "." + chunkField.path(), childFields),
-                new IndexingPlan(plan.messageFullName(), parentFields));
+                new IndexMapping(plan.messageFullName() + "." + chunkField.path(), childFields),
+                new IndexMapping(plan.messageFullName(), parentFields));
     }
 
     /**
@@ -194,10 +194,10 @@ public final class BlockJoinLuceneMapper implements SearchEngineIndexer {
      * the vocabulary: the {@code role=chunks} engine param, then a lone
      * repeated NESTED field.
      */
-    private static IndexingPlan.IndexedField resolveChunkField(IndexingPlan plan)
+    private static IndexMapping.IndexedField resolveChunkField(IndexMapping plan)
             throws MappingException {
-        List<IndexingPlan.IndexedField> candidates = new ArrayList<>();
-        for (IndexingPlan.IndexedField field : plan.fields()) {
+        List<IndexMapping.IndexedField> candidates = new ArrayList<>();
+        for (IndexMapping.IndexedField field : plan.fields()) {
             if (field.hint().blockRole() == BlockRole.CHUNKS) {
                 return field;
             }

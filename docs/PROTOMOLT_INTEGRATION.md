@@ -13,7 +13,7 @@ The projects have complementary responsibilities:
 | Descriptor loading and registry integration | Collection and shard lifecycle |
 | Schema compatibility and validation | Lucene readers, writers, commits, and recovery |
 | Mapping, CEL, metadata, and sensitivity policy | Query coordination and peer routing |
-| Indexing hints and `IndexingPlan` | Shared-floor HNSW execution |
+| Indexing hints and `IndexMapping` | Shared-floor HNSW execution |
 | `DynamicMessage` to Lucene `Document` projection | Global result merge and search telemetry |
 | gRPC reflection and dynamic invocation tooling | Search-specific public APIs |
 
@@ -32,7 +32,7 @@ An indexed record should identify all of the following:
 - optional precomputed embeddings keyed by field path or representation name.
 
 At ingestion time the server resolves the descriptor through ProtoMolt,
-validates the message, creates an `IndexingPlan`, and maps the `DynamicMessage`
+validates the message, creates an `IndexMapping`, and maps the `DynamicMessage`
 with ProtoMolt's Lucene plugin. Distributed Search then routes and writes the
 resulting Lucene document.
 
@@ -78,7 +78,7 @@ through the existing Lucene reader and shared-floor collector.
 
 ### 3. Make the query compiler plan-aware
 
-Translate ProtoMolt `IndexingPlan` field kinds, analyzers, vector dimensions,
+Translate ProtoMolt `IndexMapping` field kinds, analyzers, vector dimensions,
 and similarities into the query compiler's schema view. The query compiler
 must reject fields that are stored but not searchable and must validate vector
 dimensions before fan-out.

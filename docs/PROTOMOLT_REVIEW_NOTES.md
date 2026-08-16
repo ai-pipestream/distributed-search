@@ -40,14 +40,14 @@ three focused code reviews (index SPI, MCP/actions, build/release).
 ## 3. Index SPI — how Lucene/OpenSearch/Solr plug in
 
 Contract (`index/spi`): a backend is a **document mapper**, ServiceLoader-
-discovered. `SearchEngineIndexer` = `engineId()` + `map(Message, IndexingPlan)`
+discovered. `SearchEngineIndexer` = `engineId()` + `map(Message, IndexMapping)`
 (`index/spi/.../SearchEngineIndexer.java:11-17`), plus a
 `SearchEngineIndexerProvider` and the one-line `META-INF/services` file.
 `IndexerContext` carries **only** a `ProtoFieldMapper`.
 
 - Hints are protobuf FieldOptions (incl. `vector_dims`, `vector_similarity`,
   `vector_element_type`, `hnsw{m, ef_construction}`) baked into descriptors;
-  `IndexingPlanFactory` walks descriptors with a catalog → proto-options →
+  `IndexMappingFactory` walks descriptors with a catalog → proto-options →
   inference chain. Ships as `protomolt-index-spi`.
 - `index-lucene`: `ProtoLuceneMapper` maps DynamicMessage → Lucene `Document`
   (emits `KnnFloatVectorField`/`KnnByteVectorField` with the hinted similarity,
