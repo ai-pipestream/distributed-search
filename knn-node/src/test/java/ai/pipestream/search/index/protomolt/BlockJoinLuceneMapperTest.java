@@ -5,8 +5,8 @@ import ai.pipestream.proto.index.hints.FieldIndexHint;
 import ai.pipestream.proto.index.hints.IndexFieldType;
 import ai.pipestream.proto.index.hints.IndexingHintsProto;
 import ai.pipestream.proto.index.spi.IndexFieldKind;
-import ai.pipestream.proto.index.spi.IndexingPlan;
-import ai.pipestream.proto.index.spi.IndexingPlanFactory;
+import ai.pipestream.proto.index.spi.IndexMapping;
+import ai.pipestream.proto.index.spi.IndexMappingFactory;
 import ai.pipestream.proto.index.spi.InferringIndexingHintSource;
 import ai.pipestream.proto.index.spi.ProtoOptionsIndexingHintSource;
 import ai.pipestream.proto.index.spi.ResolvedFieldHint;
@@ -107,17 +107,17 @@ class BlockJoinLuceneMapperTest {
                 .build();
     }
 
-    private static IndexingPlan articlePlan() {
-        return new IndexingPlan("pm.Article", List.of(
-                new IndexingPlan.IndexedField("doc_id", "doc_id",
+    private static IndexMapping articlePlan() {
+        return new IndexMapping("pm.Article", List.of(
+                new IndexMapping.IndexedField("doc_id", "doc_id",
                         role(IndexFieldKind.KEYWORD, BlockJoinLuceneMapper.ROLE_DOC_ID)),
-                new IndexingPlan.IndexedField("title", "title",
+                new IndexMapping.IndexedField("title", "title",
                         ResolvedFieldHint.of(IndexFieldKind.TEXT)),
-                new IndexingPlan.IndexedField("passages", "passages",
+                new IndexMapping.IndexedField("passages", "passages",
                         ResolvedFieldHint.of(IndexFieldKind.NESTED), true),
-                new IndexingPlan.IndexedField("passages.text", "text",
+                new IndexMapping.IndexedField("passages.text", "text",
                         ResolvedFieldHint.of(IndexFieldKind.TEXT)),
-                new IndexingPlan.IndexedField("passages.embedding", "embedding",
+                new IndexMapping.IndexedField("passages.embedding", "embedding",
                         ResolvedFieldHint.builder(IndexFieldKind.VECTOR)
                                 .vectorDims(4).vectorSimilarity(VectorSimilarity.COSINE)
                                 .build(), true)));
@@ -230,7 +230,7 @@ class BlockJoinLuceneMapperTest {
 
     /**
      * The first-class vocabulary end to end: BLOCK_ROLE hints in proto
-     * options drive IndexingPlanFactory, whose plan drives the mapper with
+     * options drive IndexMappingFactory, whose plan drives the mapper with
      * no engine params anywhere.
      */
     @Test
@@ -289,7 +289,7 @@ class BlockJoinLuceneMapperTest {
                 new Descriptors.FileDescriptor[0]);
         Descriptors.Descriptor descriptor = file.findMessageTypeByName("HintedArticle");
 
-        IndexingPlan plan = new IndexingPlanFactory(
+        IndexMapping plan = new IndexMappingFactory(
                 new ProtoOptionsIndexingHintSource().orElse(new InferringIndexingHintSource()))
                 .create(descriptor);
 
@@ -322,17 +322,17 @@ class BlockJoinLuceneMapperTest {
     @Test
     void rejectsPlansTheBlockContractCannotHold() {
         // A VECTOR field outside the chunk scope would put a vector on the stub.
-        IndexingPlan stubVector = new IndexingPlan("pm.Article", List.of(
-                new IndexingPlan.IndexedField("title", "title_vec",
+        IndexMapping stubVector = new IndexMapping("pm.Article", List.of(
+                new IndexMapping.IndexedField("title", "title_vec",
                         ResolvedFieldHint.builder(IndexFieldKind.VECTOR).vectorDims(4).build()),
-                new IndexingPlan.IndexedField("passages", "passages",
+                new IndexMapping.IndexedField("passages", "passages",
                         ResolvedFieldHint.of(IndexFieldKind.NESTED), true)));
         Assertions.assertThrows(MappingException.class,
                 () -> mapper.map("d", 1, article("d", "t", new float[]{1, 0, 0, 0}), stubVector));
 
         // No repeated NESTED field: nothing to build children from.
-        IndexingPlan flat = new IndexingPlan("pm.Article", List.of(
-                new IndexingPlan.IndexedField("title", "title",
+        IndexMapping flat = new IndexMapping("pm.Article", List.of(
+                new IndexMapping.IndexedField("title", "title",
                         ResolvedFieldHint.of(IndexFieldKind.TEXT))));
         Assertions.assertThrows(MappingException.class,
                 () -> mapper.map("d", 1, article("d", "t", new float[]{1, 0, 0, 0}), flat));
@@ -342,10 +342,10 @@ class BlockJoinLuceneMapperTest {
                 () -> mapper.map("d", 1, article("d", "t"), articlePlan()));
 
         // The SPI entry point needs an identity field.
-        IndexingPlan noIdentity = new IndexingPlan("pm.Article", List.of(
-                new IndexingPlan.IndexedField("passages", "passages",
+        IndexMapping noIdentity = new IndexMapping("pm.Article", List.of(
+                new IndexMapping.IndexedField("passages", "passages",
                         ResolvedFieldHint.of(IndexFieldKind.NESTED), true),
-                new IndexingPlan.IndexedField("passages.embedding", "embedding",
+                new IndexMapping.IndexedField("passages.embedding", "embedding",
                         ResolvedFieldHint.builder(IndexFieldKind.VECTOR).vectorDims(4).build(), true)));
         Assertions.assertThrows(MappingException.class,
                 () -> mapper.map(article("d", "t", new float[]{1, 0, 0, 0}), noIdentity));
