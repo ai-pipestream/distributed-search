@@ -1,7 +1,7 @@
 # ScaleCube Cluster: gossip-based membership (lighter than scalecube-services)
 # Stork: Quarkus-native service discovery (custom provider for ScaleCube)
 [versions]
-scalecube-cluster = "2.7.9"
+scalecube-cluster = "2.7.10"
 stork = "2.7.11"
 
 [libraries]
