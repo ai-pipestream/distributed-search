@@ -45,7 +45,7 @@ configurations.configureEach {
         // than its runtime at class-load time. Force the patch bump; force wins
         // over the enforced platform.
         force 'com.google.protobuf:protobuf-java:4.35.1'
-        force 'com.google.protobuf:protobuf-java-util:4.35.1'
+        force 'com.google.protobuf:protobuf-java-util:4.36.1'
         // The fork and protomolt snapshots move under this build. Gradle's
         // default 24h snapshot TTL makes a restored CI cache serve yesterday's
         // jars and fail compiles against classes that are already published;
