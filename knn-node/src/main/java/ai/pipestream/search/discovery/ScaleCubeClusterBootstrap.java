@@ -50,7 +50,7 @@ public class ScaleCubeClusterBootstrap {
             String bindHost = ConfigProvider.getConfig()
                     .getOptionalValue("knn.scalecube.host", String.class).orElse(null);
 
-            ClusterConfig config = ClusterConfig.defaultLanConfig()
+            ClusterConfig config = new ClusterConfig()
                     .externalHost(bindHost)
                     .transport(t -> t.port(scaleCubePort).transportFactory(new TcpTransportFactory()))
                     .membership(m -> m.seedMembers(seeds));
