@@ -5,11 +5,11 @@ plugins {
 dependencies {
   api project(':embeddings-spi')
   // REST transport (batched path).
-  implementation 'com.fasterxml.jackson.core:jackson-databind:2.22.3'
+  implementation 'com.fasterxml.jackson.core:jackson-databind:2.22.4'
   // gRPC transport (streaming-worker path).
-  implementation 'io.grpc:grpc-netty-shaded:1.85.0'
-  implementation 'io.grpc:grpc-protobuf:1.85.0'
-  implementation 'io.grpc:grpc-stub:1.85.0'
+  implementation 'io.grpc:grpc-netty-shaded:1.85.1'
+  implementation 'io.grpc:grpc-protobuf:1.85.1'
+  implementation 'io.grpc:grpc-stub:1.85.1'
   implementation 'com.google.protobuf:protobuf-java:4.36.2'
   // Generated gRPC stubs annotate with javax.annotation.Generated.
   compileOnly 'org.apache.tomcat:annotations-api:6.0.53'
@@ -21,7 +21,7 @@ protobuf {
   }
   plugins {
     grpc {
-      artifact = 'io.grpc:protoc-gen-grpc-java:1.85.0'
+      artifact = 'io.grpc:protoc-gen-grpc-java:1.85.1'
     }
   }
   generateProtoTasks {
